@@ -32,6 +32,7 @@ These rules are **binding across all sessions**. If a task would violate one of 
 - Project identity = directory name under `~/.claude/projects/` (it encodes the working directory path with `/` → `-`). Display name: prefer the last path component of the records' `cwd` field (the real path); fall back to best-effort decoding of the dir name.
 - Dates are computed in the **local timezone** (matches ccusage defaults).
 - Cost estimation uses a **static, hardcoded pricing table** keyed by model-name substring, per-million-token rates: input, output, cache write = 1.25× input, cache read = 0.1× input. Unknown model → count tokens, show cost as `—`, never guess. **No network calls, ever.** Label all dollar figures "est. API value" (subscription users don't pay per token).
+- **Persisted daily aggregates:** on every run, persist daily aggregates (project, day, model, token counts, est. cost) as JSON in `~/.local/share/agentop/history/`; merge persisted history with live JSONL data at load, deduplicating by (project, day, model). For overlapping keys the live JSONL scan wins (it is the source of truth); history keeps days visible after Claude Code prunes old transcripts. This is our **only write path** and it never touches `~/.claude/`.
 - **Oracle check:** `scripts/verify.sh` runs `npx ccusage@latest daily --json` and diffs its per-day token totals against `agentop dump --json`. Milestone 1 is not done until totals match within rounding.
 
 ## Testing discipline
