@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
-use agentop::aggregate::{aggregate, Aggregates, Totals};
+use agentop::aggregate::{build_cube, rollup, Aggregates, Cube, Totals};
+use agentop::history;
 use agentop::source::claude_code::ClaudeCodeSource;
 use agentop::source::{ScanStats, Source};
 
@@ -22,33 +23,51 @@ enum Command {
     },
 }
 
-fn main() {
-    let cli = Cli::parse();
-    match cli.command {
-        Some(Command::Dump { json }) => dump(json),
-        None => {
-            // Milestone 2 will launch the dashboard here.
-            eprintln!("dashboard not implemented yet — try `agentop dump --json`");
-            std::process::exit(2);
-        }
-    }
+struct Loaded {
+    cube: Cube,
+    stats: ScanStats,
+    duplicates_skipped: u64,
 }
 
-fn dump(as_json: bool) {
+/// Scan the live JSONL data, then merge with (and persist to) the history
+/// store — agentop's only write path, and it never touches `~/.claude/`.
+fn load() -> Loaded {
     let Some(source) = ClaudeCodeSource::new() else {
         eprintln!("could not locate home directory");
         std::process::exit(1);
     };
     let scan = source.scan();
-    let agg = aggregate(&scan.records);
+    let dedup = build_cube(&scan.records);
+    let cube = match history::default_dir() {
+        Some(dir) => history::sync(&dir, &dedup.cube),
+        None => dedup.cube,
+    };
+    Loaded { cube, stats: scan.stats, duplicates_skipped: dedup.duplicates_skipped }
+}
 
+fn main() {
+    let cli = Cli::parse();
+    let loaded = load();
+    match cli.command {
+        Some(Command::Dump { json }) => dump(&loaded, json),
+        None => {
+            if let Err(e) = agentop::ui::run(loaded.cube, loaded.stats) {
+                eprintln!("terminal error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn dump(loaded: &Loaded, as_json: bool) {
+    let agg = rollup(&loaded.cube, loaded.duplicates_skipped);
     if as_json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&to_json(source.name(), &agg, &scan.stats)).unwrap()
+            serde_json::to_string_pretty(&to_json("claude-code", &agg, &loaded.stats)).unwrap()
         );
     } else {
-        print_summary(&agg, &scan.stats);
+        print_summary(&agg, &loaded.stats);
     }
 }
 

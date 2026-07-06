@@ -160,6 +160,14 @@ pub fn parse_line(line: &str, project_key: &str) -> LineOutcome {
     let Some(usage) = message.usage else {
         return LineOutcome::Skipped;
     };
+    // Zero-usage records (e.g. `<synthetic>` placeholders) carry no signal
+    // and would pollute model buckets / the unknown-pricing flag.
+    if usage.input_tokens + usage.output_tokens + usage.cache_creation_input_tokens
+        + usage.cache_read_input_tokens
+        == 0
+    {
+        return LineOutcome::Skipped;
+    }
     let Some(timestamp) = raw
         .timestamp
         .as_deref()

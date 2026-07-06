@@ -39,9 +39,14 @@ for day in sorted(set(ours) | set(theirs)):
         print(f"  {day}: skipped (still being written)")
         continue
     o, t = ours.get(day), theirs.get(day)
-    if o is None or t is None:
-        print(f"  {day}: only in {'ccusage' if o is None else 'agentop'}")
+    if o is None:
+        print(f"  {day}: only in ccusage (missing from agentop)")
         bad += 1
+        continue
+    if t is None:
+        # agentop merges persisted history, so it keeps days whose JSONL
+        # transcripts Claude Code has already pruned. Not an error.
+        print(f"  {day}: only in agentop (history of pruned transcripts) — ok")
         continue
     checked += 1
     for of, tf in fields:
