@@ -1,0 +1,3 @@
+{"type":"assistant","requestId":"req_C","timestamp":"2026-07-02T11:00:00.000Z","cwd":"/Users/test/beta","sessionId":"s2","message":{"id":"msg_C","model":"claude-haiku-4-5-20251001","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+THIS IS NOT JSON {{{
+{"type":"assistant","requestId":"req_D","timestamp":"2026-07-02T12:00:00.000Z","cwd":"/Users/test/beta","sessionId":"s2","message":{"id":"msg_D","model":"claude-haiku-4-5-20251001","usage":{"input_tokens":20,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
