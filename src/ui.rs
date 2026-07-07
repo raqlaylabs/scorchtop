@@ -45,7 +45,9 @@ fn bar_tip(rank: usize) -> (u8, u8, u8) {
 /// Model-family colors for the split-by-model bar mode and the models panel.
 fn model_color(model: &str) -> Color {
     let m = model.to_ascii_lowercase();
-    if m.contains("opus") || m.contains("fable") || m.contains("mythos") {
+    if m.contains("fable") || m.contains("mythos") {
+        Color::Rgb(244, 114, 182) // pink
+    } else if m.contains("opus") {
         Color::Rgb(192, 132, 252) // violet
     } else if m.contains("sonnet") {
         Color::Rgb(56, 214, 240) // cyan
@@ -59,7 +61,9 @@ fn model_color(model: &str) -> Color {
 /// Family label for the legend ("opus", "sonnet", ...).
 fn model_family(model: &str) -> &'static str {
     let m = model.to_ascii_lowercase();
-    if m.contains("opus") || m.contains("fable") || m.contains("mythos") {
+    if m.contains("fable") || m.contains("mythos") {
+        "fable"
+    } else if m.contains("opus") {
         "opus"
     } else if m.contains("sonnet") {
         "sonnet"
@@ -99,6 +103,9 @@ const ENERGY_DECAY: f64 = 0.97;
 const PEAK_FALL: f64 = 0.008;
 /// Adaptive full-scale floor for the equalizer, in tokens of burst energy.
 const SCALE_FLOOR: f64 = 150_000.0;
+/// Live-but-quiet sessions groove at this baseline height instead of dying —
+/// the panel keeps dancing while anything is active; spikes still mean tokens.
+const LIVE_FLOOR: f64 = 0.18;
 
 /// Per-project equalizer state, all presentation: normalized height 0..1,
 /// falling peak cap, and a phase that makes the column tops ripple.
@@ -184,11 +191,19 @@ impl App {
             }
         }
 
+        // Every live project keeps a band, so the groove floor applies even
+        // before its first token burst of the session.
+        for name in &self.live.active_projects {
+            self.bands.entry(name.clone()).or_default();
+        }
         let mut max_energy: f64 = 0.0;
-        for band in self.bands.values_mut() {
+        for (name, band) in self.bands.iter_mut() {
             band.energy *= ENERGY_DECAY;
             max_energy = max_energy.max(band.energy);
-            let target = (band.energy / self.scale).powf(0.6).min(1.0);
+            let mut target = (band.energy / self.scale).powf(0.6).min(1.0);
+            if self.live.active_projects.contains(name) {
+                target = target.max(LIVE_FLOOR);
+            }
             // Fast attack, eased release.
             band.height = if target > band.height {
                 target
@@ -489,16 +504,15 @@ fn draw_equalizer(frame: &mut Frame, area: Rect, app: &App) {
         let mut spans: Vec<Span> = Vec::new();
         for name in names {
             let band = app.bands.get(*name).unwrap_or(&empty);
-            let active = app.live.active_projects.contains(*name);
-            // Live-but-quiet projects hold a faint ember baseline.
-            let base = if active { band.height.max(0.05) } else { band.height };
+            let base = band.height;
             let peak_cell = (band.peak * rows as f64).round();
             let left_pad = (slot_w - band_w) / 2;
             spans.push(Span::raw(" ".repeat(left_pad)));
             for sub in 0..band_w {
-                // Each sub-column ripples around the band height.
-                let ripple = 1.0 + 0.10 * (band.phase + sub as f64 * 1.9).sin();
-                let h = (base * ripple).clamp(0.0, 1.0) * rows as f64;
+                // Each sub-column ripples around the band height; the floor
+                // term keeps ~1 cell of motion even at the groove baseline.
+                let wobble = (0.05 + 0.08 * base) * (band.phase + sub as f64 * 1.9).sin();
+                let h = (base + wobble).clamp(0.0, 1.0) * rows as f64;
                 let filled = h - from_bottom;
                 let (ch, style) = if filled >= 1.0 {
                     ('█', Style::new().fg(eq_color(from_bottom / rows as f64)))
