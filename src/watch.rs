@@ -25,16 +25,18 @@ use notify::{RecursiveMode, Watcher};
 use crate::aggregate::{cube_from, dedup, Cube};
 use crate::history;
 use crate::lines::LineBuffer;
-use crate::source::claude_code::{display_name_from_key, parse_line, LineOutcome};
+use crate::source::claude_code::{display_name_from_key, parse_line, LineOutcome, TurnSignal};
 use crate::source::{ScanStats, UsageRecord};
 
-/// Last observed write per project. Activity is keyed off file mtimes, not
-/// usage-record timestamps: an agent mid-task can go minutes between usage
-/// records (long tool runs) while still writing tool-result lines, and at
-/// startup mtimes tell us who was just active before we launched.
+/// Per-project turn state. `working` follows the transcript's own protocol —
+/// a user line (prompt or tool result) starts a turn, an assistant
+/// `end_turn` finishes it — so "live" means Claude is actually working, not
+/// "the user replied recently". `last_write` (file mtime) is kept as a crash
+/// guard: a session that died mid-turn stops counting once writes go stale.
 #[derive(Debug, Clone)]
 pub struct ProjectActivity {
     pub name: String,
+    pub working: bool,
     pub last_write: DateTime<Utc>,
 }
 
@@ -57,6 +59,9 @@ struct TailState {
     /// Bytes consumed so far (including any buffered partial line).
     offset: u64,
     buf: LineBuffer,
+    /// Whether this session is mid-turn: set by user lines (prompts, tool
+    /// results), cleared by an assistant `end_turn`.
+    working: bool,
 }
 
 /// Incremental tailer over `<root>/<project>/**/*.jsonl`. Accumulates raw
@@ -127,6 +132,7 @@ impl Tailer {
             project_key: project_key.clone(),
             offset: 0,
             buf: LineBuffer::new(),
+            working: false,
         });
 
         // open -> seek -> read -> close; never keep a handle on Claude Code's files.
@@ -166,9 +172,15 @@ impl Tailer {
         drop(file);
         state.offset += bytes.len() as u64;
 
+        let apply = |working: &mut bool, signal: TurnSignal| match signal {
+            TurnSignal::Working => *working = true,
+            TurnSignal::TurnEnded => *working = false,
+            TurnSignal::Neutral => {}
+        };
         for line in state.buf.push(&bytes) {
             match parse_line(&line, &state.project_key) {
-                LineOutcome::Record(r) => {
+                LineOutcome::Record(r, signal) => {
+                    apply(&mut state.working, signal);
                     if let Some(cwd) = &r.cwd {
                         if let Some(name) = cwd.rsplit('/').find(|s| !s.is_empty()) {
                             self.names.insert(state.project_key.clone(), name.to_string());
@@ -176,13 +188,14 @@ impl Tailer {
                     }
                     self.records.push(*r);
                 }
-                LineOutcome::Skipped => {}
+                LineOutcome::Skipped(signal) => apply(&mut state.working, signal),
                 LineOutcome::Malformed => self.malformed_lines += 1,
             }
         }
         if probe_tail {
             if let Some(tail) = state.buf.partial_str() {
-                if let LineOutcome::Record(r) = parse_line(&tail, &state.project_key) {
+                if let LineOutcome::Record(r, signal) = parse_line(&tail, &state.project_key) {
+                    apply(&mut state.working, signal);
                     self.records.push(*r);
                 }
             }
@@ -200,6 +213,13 @@ impl Tailer {
             .filter(|r| r.timestamp >= cutoff)
             .map(|r| (*r).clone())
             .collect();
+        // A project is mid-turn if any of its sessions is.
+        let mut working: std::collections::HashSet<&str> = Default::default();
+        for state in self.states.values() {
+            if state.working {
+                working.insert(&state.project_key);
+            }
+        }
         let activity = self
             .arrivals
             .iter()
@@ -209,6 +229,7 @@ impl Tailer {
                     .get(key)
                     .cloned()
                     .unwrap_or_else(|| display_name_from_key(key)),
+                working: working.contains(key.as_str()),
                 last_write: *last_write,
             })
             .collect();
@@ -417,28 +438,37 @@ mod tests {
     }
 
     #[test]
-    fn skipped_line_writes_still_mark_project_active() {
+    fn turn_state_follows_user_lines_and_end_turn() {
         let root = temp_root("activity");
         let file = root.join("-u-alpha").join("s.jsonl");
+        // Assistant record without stop_reason == mid-turn.
         fs::write(&file, format!("{LINE_A}\n")).unwrap();
 
         let mut tailer = Tailer::new(root.clone());
         tailer.scan_all(false);
         let before = tailer.snapshot(&Cube::new());
         assert_eq!(before.activity.len(), 1, "startup seeds activity from mtime");
+        assert!(before.activity[0].working, "assistant mid-turn record => working");
         let t0 = before.activity[0].last_write;
 
-        // A tool-result write: parser skips it, but the project is clearly live.
+        // The reply completes: assistant end_turn => the human is reading.
         std::thread::sleep(Duration::from_millis(1100)); // mtime granularity
+        let done = LINE_B.replace(r#""model""#, r#""stop_reason":"end_turn","model""#);
+        let mut f = fs::OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(f, "{done}").unwrap();
+        drop(f);
+        assert!(tailer.read_path(&file, false));
+        let after = tailer.snapshot(&Cube::new());
+        assert!(!after.activity[0].working, "end_turn must clear working");
+        assert!(after.activity[0].last_write > t0, "last_write must advance");
+        assert_eq!(after.activity[0].name, "alpha", "display name comes from records' cwd");
+
+        // A tool-result/prompt write: parser skips it, but a turn is running.
         let mut f = fs::OpenOptions::new().append(true).open(&file).unwrap();
         writeln!(f, r#"{{"type":"user","message":{{"role":"user"}}}}"#).unwrap();
         drop(f);
-
         assert!(tailer.read_path(&file, false), "skipped-only write must report a change");
-        let after = tailer.snapshot(&Cube::new());
-        assert_eq!(after.activity.len(), 1);
-        assert!(after.activity[0].last_write > t0, "last_write must advance");
-        assert_eq!(after.activity[0].name, "alpha", "display name comes from records' cwd");
+        assert!(tailer.snapshot(&Cube::new()).activity[0].working, "user line => working");
 
         fs::remove_dir_all(&root).unwrap();
     }

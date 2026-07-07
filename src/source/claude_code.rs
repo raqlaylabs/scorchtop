@@ -85,8 +85,8 @@ fn scan_bytes(bytes: &[u8], project_key: &str, records: &mut Vec<UsageRecord>, s
     let mut buf = LineBuffer::new();
     for line in buf.push(bytes) {
         match parse_line(&line, project_key) {
-            LineOutcome::Record(r) => records.push(*r),
-            LineOutcome::Skipped => {}
+            LineOutcome::Record(r, _) => records.push(*r),
+            LineOutcome::Skipped(_) => {}
             LineOutcome::Malformed => stats.malformed_lines += 1,
         }
     }
@@ -94,25 +94,39 @@ fn scan_bytes(bytes: &[u8], project_key: &str, records: &mut Vec<UsageRecord>, s
     // may be mid-append. Parse the tail if it parses; a torn line is silently
     // ignored (never a parse error, and it will be complete on the next read).
     if let Some(tail) = buf.take_partial() {
-        if let LineOutcome::Record(r) = parse_line(&tail, project_key) {
+        if let LineOutcome::Record(r, _) = parse_line(&tail, project_key) {
             records.push(*r);
         }
     }
 }
 
 pub enum LineOutcome {
-    Record(Box<UsageRecord>),
+    Record(Box<UsageRecord>, TurnSignal),
     /// Valid JSON that isn't an assistant usage record (user turns,
     /// attachments, snapshots, ...). Not an error.
-    Skipped,
+    Skipped(TurnSignal),
     /// Not valid JSON.
     Malformed,
+}
+
+/// What a transcript line says about whether Claude is mid-turn. Drives the
+/// live indicator: a user line (prompt or tool result) means work is starting
+/// or continuing; an assistant `end_turn` means the reply is finished and the
+/// human is reading/typing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnSignal {
+    Working,
+    TurnEnded,
+    /// No turn information (snapshots, system lines, subagent sidechains).
+    Neutral,
 }
 
 #[derive(Deserialize)]
 struct RawLine {
     #[serde(rename = "type")]
     kind: Option<String>,
+    #[serde(rename = "isSidechain")]
+    is_sidechain: Option<bool>,
     message: Option<RawMessage>,
     #[serde(rename = "requestId")]
     request_id: Option<String>,
@@ -127,6 +141,7 @@ struct RawMessage {
     id: Option<String>,
     model: Option<String>,
     usage: Option<RawUsage>,
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -145,20 +160,38 @@ struct RawUsage {
 pub fn parse_line(line: &str, project_key: &str) -> LineOutcome {
     let line = line.trim();
     if line.is_empty() {
-        return LineOutcome::Skipped;
+        return LineOutcome::Skipped(TurnSignal::Neutral);
     }
     let raw: RawLine = match serde_json::from_str(line) {
         Ok(raw) => raw,
         Err(_) => return LineOutcome::Malformed,
     };
+    // Subagent sidechains run inside the main turn; their signals would
+    // flicker the state, so they carry none.
+    let signal = if raw.is_sidechain == Some(true) {
+        TurnSignal::Neutral
+    } else {
+        match raw.kind.as_deref() {
+            Some("user") => TurnSignal::Working,
+            Some("assistant") => {
+                let ended = raw
+                    .message
+                    .as_ref()
+                    .and_then(|m| m.stop_reason.as_deref())
+                    == Some("end_turn");
+                if ended { TurnSignal::TurnEnded } else { TurnSignal::Working }
+            }
+            _ => TurnSignal::Neutral,
+        }
+    };
     if raw.kind.as_deref() != Some("assistant") {
-        return LineOutcome::Skipped;
+        return LineOutcome::Skipped(signal);
     }
     let Some(message) = raw.message else {
-        return LineOutcome::Skipped;
+        return LineOutcome::Skipped(signal);
     };
     let Some(usage) = message.usage else {
-        return LineOutcome::Skipped;
+        return LineOutcome::Skipped(signal);
     };
     // Zero-usage records (e.g. `<synthetic>` placeholders) carry no signal
     // and would pollute model buckets / the unknown-pricing flag.
@@ -166,7 +199,7 @@ pub fn parse_line(line: &str, project_key: &str) -> LineOutcome {
         + usage.cache_read_input_tokens
         == 0
     {
-        return LineOutcome::Skipped;
+        return LineOutcome::Skipped(signal);
     }
     let Some(timestamp) = raw
         .timestamp
@@ -174,9 +207,10 @@ pub fn parse_line(line: &str, project_key: &str) -> LineOutcome {
         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
         .map(|t| t.with_timezone(&Utc))
     else {
-        return LineOutcome::Skipped;
+        return LineOutcome::Skipped(signal);
     };
-    LineOutcome::Record(Box::new(UsageRecord {
+    LineOutcome::Record(
+        Box::new(UsageRecord {
         project_key: project_key.to_string(),
         cwd: raw.cwd,
         session_id: raw.session_id,
@@ -188,9 +222,11 @@ pub fn parse_line(line: &str, project_key: &str) -> LineOutcome {
             input: usage.input_tokens,
             output: usage.output_tokens,
             cache_create: usage.cache_creation_input_tokens,
-            cache_read: usage.cache_read_input_tokens,
-        },
-    }))
+                cache_read: usage.cache_read_input_tokens,
+            },
+        }),
+        signal,
+    )
 }
 
 /// Best-effort decode of the encoded project directory name
@@ -211,7 +247,8 @@ mod tests {
 
     #[test]
     fn parses_assistant_record() {
-        let LineOutcome::Record(r) = parse_line(ASSISTANT_LINE, "-Users-naman-Documents-demo")
+        let LineOutcome::Record(r, signal) =
+            parse_line(ASSISTANT_LINE, "-Users-naman-Documents-demo")
         else {
             panic!("expected record");
         };
@@ -219,15 +256,34 @@ mod tests {
         assert_eq!(r.message_id.as_deref(), Some("msg_1"));
         assert_eq!(r.request_id.as_deref(), Some("req_1"));
         assert_eq!(r.usage.total(), 165);
+        assert_eq!(signal, TurnSignal::Working, "no stop_reason => mid-turn");
     }
 
     #[test]
     fn skips_non_assistant_lines() {
         assert!(matches!(
             parse_line(r#"{"type":"user","message":{"role":"user","content":"hi"}}"#, "p"),
-            LineOutcome::Skipped
+            LineOutcome::Skipped(TurnSignal::Working)
         ));
-        assert!(matches!(parse_line("", "p"), LineOutcome::Skipped));
+        assert!(matches!(parse_line("", "p"), LineOutcome::Skipped(TurnSignal::Neutral)));
+    }
+
+    #[test]
+    fn turn_signals_classify_end_turn_and_sidechains() {
+        // end_turn on the assistant record finishes the turn.
+        let done = ASSISTANT_LINE.replace(r#""role":"assistant""#, r#""stop_reason":"end_turn""#);
+        assert!(matches!(
+            parse_line(&done, "p"),
+            LineOutcome::Record(_, TurnSignal::TurnEnded)
+        ));
+        // Sidechain (subagent) lines carry no turn signal.
+        let side = ASSISTANT_LINE.replace(r#"{"type":"assistant""#, r#"{"isSidechain":true,"type":"assistant""#);
+        assert!(matches!(parse_line(&side, "p"), LineOutcome::Record(_, TurnSignal::Neutral)));
+        // Non-record lines still classify: snapshots are neutral.
+        assert!(matches!(
+            parse_line(r#"{"type":"file-history-snapshot"}"#, "p"),
+            LineOutcome::Skipped(TurnSignal::Neutral)
+        ));
     }
 
     #[test]

@@ -46,9 +46,13 @@ terminal. Use it to eyeball the equalizer physics and record GIFs.
   `output_tokens` → totals grow only by the output delta.
 - Write isolation: after quit, `find $SANDBOX/home/.claude -type f` shows only
   your fixtures; history lands in `$SANDBOX/xdg/agentop/history/daily.json`.
-- Activity signal: append a `{"type":"user",...}` line (no usage) → project
-  must flip to `● live` within ~1s (activity is mtime-based, not record-based).
-  Backdate a file with `touch -t` before launch → must NOT show live at startup.
+- Activity signal (turn-state based): a `{"type":"user",...}` line (prompt or
+  tool result) flips the project to `● live` within ~1s; an assistant line
+  with `"stop_reason":"end_turn"` flips it back to idle — even if the file
+  mtime is fresh (user reading/typing is NOT live). Assistant lines without
+  stop_reason (or with `tool_use`) count as mid-turn. A session that dies
+  mid-turn goes idle after 10 min of no writes (crash guard). Sidechain lines
+  (`"isSidechain":true`) must not affect the state.
 
 ## Oracle (data correctness)
 

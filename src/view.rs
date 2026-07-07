@@ -153,13 +153,15 @@ pub struct LiveStats {
     pub is_active: bool,
 }
 
-/// A session mid-task can go minutes between writes (one long tool run emits
-/// nothing until it finishes), so "live" tolerates a 3-minute silence.
-const ACTIVE_WINDOW_SECS: i64 = 180;
+/// Crash guard for the working flag: a session that died mid-turn (so no
+/// `end_turn` ever arrives) stops counting as live once its file has been
+/// silent this long. Long tool runs gap ~3-4 min, so this stays generous.
+const STALE_WORK_SECS: i64 = 600;
 
 /// Compute sparkline/burn from records of roughly the last hour, and the
-/// active set from per-project last-write times (file mtimes — see
-/// `ProjectActivity`). `now` is injected for testability.
+/// active set from per-project turn state: live = an unfinished turn (see
+/// `ProjectActivity::working`) with non-stale writes. `now` is injected for
+/// testability.
 pub fn live_stats(
     recent: &[crate::source::UsageRecord],
     activity: &[crate::watch::ProjectActivity],
@@ -175,10 +177,10 @@ pub fn live_stats(
         }
     }
 
-    let active_cutoff = now - chrono::Duration::seconds(ACTIVE_WINDOW_SECS);
+    let stale_cutoff = now - chrono::Duration::seconds(STALE_WORK_SECS);
     let mut active: std::collections::BTreeSet<String> = Default::default();
     for a in activity {
-        if a.last_write >= active_cutoff {
+        if a.working && a.last_write >= stale_cutoff {
             active.insert(a.name.clone());
         }
     }
@@ -329,15 +331,17 @@ mod tests {
             usage: TokenUsage { input: total, output: 0, cache_create: 0, cache_read: 0 },
         };
 
-        let act = |name: &str, secs_ago: i64| crate::watch::ProjectActivity {
+        let act = |name: &str, working: bool, secs_ago: i64| crate::watch::ProjectActivity {
             name: name.into(),
+            working,
             last_write: now - chrono::Duration::seconds(secs_ago),
         };
 
         let records = vec![rec(1, 500), rec(30, 200), rec(90, 999)];
-        // alpha wrote 170s ago (inside the 3-min window even though its last
-        // usage record could be older); beta went quiet 4 min ago.
-        let activity = vec![act("alpha", 170), act("beta", 240)];
+        // alpha is mid-turn; beta finished its reply (user is reading) and
+        // gamma died mid-turn 20 min ago (crash guard).
+        let activity =
+            vec![act("alpha", true, 170), act("beta", false, 5), act("gamma", true, 1200)];
         let stats = live_stats(&records, &activity, now);
 
         assert_eq!(stats.minute_tokens.len(), 60);
@@ -348,7 +352,7 @@ mod tests {
         assert!(stats.is_active);
         assert_eq!(stats.active_projects, vec!["alpha".to_string()]);
 
-        let idle = live_stats(&[rec(30, 200)], &[act("alpha", 240)], now);
+        let idle = live_stats(&[rec(30, 200)], &[act("alpha", false, 30)], now);
         assert!(!idle.is_active);
         assert!(idle.active_projects.is_empty());
 

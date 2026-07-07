@@ -317,10 +317,12 @@ fn draw(frame: &mut Frame, app: &App) {
     if main.width >= 110 && !app.vm.models.is_empty() {
         let [left, right] =
             Layout::horizontal([Constraint::Min(60), Constraint::Length(46)]).areas(main);
-        draw_projects(frame, left, app);
+        draw_projects(frame, left, app, false);
         draw_models(frame, right, app);
     } else {
-        draw_projects(frame, main, app);
+        // Tell the user the models panel exists — it needs more columns.
+        let widen_hint = !app.vm.models.is_empty();
+        draw_projects(frame, main, app, widen_hint);
     }
     draw_footer(frame, footer);
 }
@@ -562,12 +564,18 @@ fn draw_equalizer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_projects(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_projects(frame: &mut Frame, area: Rect, app: &App, widen_hint: bool) {
     let vm = &app.vm;
     let mut title_spans = vec![
         Span::styled(" projects ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(format!("({}) ", vm.projects.len()), Style::new().fg(DIM)),
     ];
+    if widen_hint {
+        title_spans.push(Span::styled(
+            "· ↔ widen to 110+ cols for the models panel ",
+            Style::new().fg(DIM),
+        ));
+    }
     if app.split_by_model {
         // Legend: one dot per model family present in the period.
         let mut seen: Vec<&'static str> = Vec::new();
