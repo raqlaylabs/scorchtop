@@ -315,26 +315,41 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         Span::styled("—/min", Style::new().fg(DIM))
     };
-    let stats = Line::from(vec![
+    let mut stats_spans = vec![
         Span::styled(" today ", Style::new().fg(DIM)),
         Span::styled(fmt_cost(today_cost), Style::new().fg(MONEY).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(" · {} tok", fmt_tokens(vm.today.tokens.total())),
             Style::new().fg(ACCENT),
         ),
-        Span::styled("   burn ", Style::new().fg(DIM)),
-        burn,
-        Span::styled("   Σ ", Style::new().fg(DIM)),
-        Span::styled(fmt_cost(cost_display(vm)), Style::new().fg(MONEY)),
-        Span::styled(
+    ];
+    // Most "tokens" are cache re-reads (billed at 0.1x input); surface the
+    // share so the big totals aren't mistaken for fresh context.
+    let today_total = vm.today.tokens.total();
+    if today_total > 0 {
+        let pct = vm.today.tokens.cache_read as f64 / today_total as f64 * 100.0;
+        stats_spans.push(Span::styled(
+            format!(" ({pct:.0}% cache)"),
+            Style::new().fg(DIM),
+        ));
+    }
+    stats_spans.push(Span::styled("   burn ", Style::new().fg(DIM)));
+    stats_spans.push(burn);
+    // On the day view the period totals equal the today stat; only show Σ
+    // when it adds information.
+    if app.period != Period::Day {
+        stats_spans.push(Span::styled("   Σ ", Style::new().fg(DIM)));
+        stats_spans.push(Span::styled(fmt_cost(cost_display(vm)), Style::new().fg(MONEY)));
+        stats_spans.push(Span::styled(
             format!(
                 " · {} tok · {}d active",
                 fmt_tokens(vm.period.tokens.total()),
                 vm.active_days
             ),
             Style::new().fg(DIM),
-        ),
-    ]);
+        ));
+    }
+    let stats = Line::from(stats_spans);
 
     let block = Block::new().borders(Borders::BOTTOM).border_style(Style::new().fg(BORDER));
     let inner = block.inner(area);
@@ -353,9 +368,12 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_sparkline(frame: &mut Frame, area: Rect, app: &App) {
     let [label_area, spark_area] =
-        Layout::horizontal([Constraint::Length(14), Constraint::Min(10)]).areas(area);
+        Layout::horizontal([Constraint::Length(24), Constraint::Min(10)]).areas(area);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(" tok/min · 1h ", Style::new().fg(DIM)))),
+        Paragraph::new(Line::from(Span::styled(
+            " tok/min · past hour → ",
+            Style::new().fg(DIM),
+        ))),
         label_area,
     );
     let data = &app.live.minute_tokens;
