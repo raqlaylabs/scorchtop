@@ -11,6 +11,13 @@ Never write into the real `~/.claude/` — not even test fixtures. To exercise
 the live dashboard, override `HOME` (the JSONL root is `$HOME/.claude/projects`)
 and `XDG_DATA_HOME` (isolates the history write path).
 
+## Quick demo / animation tuning
+
+`./scripts/demo-traffic.sh` streams fake bursty traffic into a sandbox
+(`AGENTOP_DEMO_DIR` overrides the location) and prints the matching
+`HOME=... XDG_DATA_HOME=... ./target/debug/agentop` command to run in a second
+terminal. Use it to eyeball the equalizer physics and record GIFs.
+
 ## Recipe
 
 1. Build: `cargo build` (binary at `target/debug/agentop`).

@@ -181,6 +181,24 @@ pub fn live_stats(
     stats
 }
 
+/// Total tokens per project (display name) over the recent window. The UI
+/// diffs consecutive results to feed the equalizer's animation energy.
+pub fn recent_project_totals(
+    recent: &[crate::source::UsageRecord],
+) -> std::collections::HashMap<String, u64> {
+    let mut totals = std::collections::HashMap::new();
+    for r in recent {
+        let name = r
+            .cwd
+            .as_deref()
+            .and_then(|c| c.rsplit('/').find(|s| !s.is_empty()))
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::source::claude_code::display_name_from_key(&r.project_key));
+        *totals.entry(name).or_insert(0) += r.usage.total();
+    }
+    totals
+}
+
 /// "12.3M", "986k", "1.2B" — compact token counts for tight columns.
 pub fn fmt_tokens(n: u64) -> String {
     let f = n as f64;
@@ -318,6 +336,11 @@ mod tests {
         let idle = live_stats(&[rec(30, 200)], &[act("alpha", 240)], now);
         assert!(!idle.is_active);
         assert!(idle.active_projects.is_empty());
+
+        // recent_project_totals groups by display name from cwd.
+        let totals = recent_project_totals(&records);
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals["alpha"], 1699);
     }
 
     #[test]

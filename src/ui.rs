@@ -1,7 +1,8 @@
 //! Ratatui dashboard. Dumb by design: it renders `Snapshot`s delivered over
 //! the mpsc channel plus pure `view()` / `live_stats()` results — every
 //! number it shows was computed in the aggregation layer. The only state it
-//! owns is presentation: the selected period and bar-easing positions.
+//! owns is presentation: the selected period, bar easing, and the equalizer's
+//! energy/peak animation.
 
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
@@ -15,33 +16,87 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Sparkline};
 use ratatui::Frame;
 
-use crate::view::{fmt_cost, fmt_tokens, live_stats, view, LiveStats, Period, ViewModel};
+use crate::view::{
+    fmt_cost, fmt_tokens, live_stats, recent_project_totals, view, LiveStats, Period, ViewModel,
+};
 use crate::watch::Snapshot;
 
-const ACCENT: Color = Color::Cyan;
-const MONEY: Color = Color::Green;
-const DIM: Color = Color::DarkGray;
-const LIVE: Color = Color::LightGreen;
-/// Cyan -> blue ramp for bars, by project rank.
-const BAR_RAMP: [Color; 6] = [
-    Color::Indexed(51),
-    Color::Indexed(45),
-    Color::Indexed(39),
-    Color::Indexed(33),
-    Color::Indexed(27),
-    Color::Indexed(61),
-];
+// ---------------------------------------------------------------------------
+// Palette: agentop paints its own dark theme (truecolor), btop-style, instead
+// of inheriting the terminal's colors.
+
+const BG: Color = Color::Rgb(9, 12, 18);
+const FG: Color = Color::Rgb(196, 205, 216);
+const DIM: Color = Color::Rgb(100, 110, 126);
+const BORDER: Color = Color::Rgb(42, 52, 68);
+const ACCENT: Color = Color::Rgb(56, 214, 240);
+const MONEY: Color = Color::Rgb(74, 222, 128);
+const LIVE: Color = Color::Rgb(94, 250, 154);
+const BADGE: Color = Color::Rgb(250, 204, 21);
+const PEAK: Color = Color::Rgb(226, 232, 240);
+
+/// Horizontal bars fade from this deep blue at their base…
+const BAR_BASE: (u8, u8, u8) = (26, 50, 86);
+/// …to a tip color that cools with project rank (top project burns hottest).
+fn bar_tip(rank: usize) -> (u8, u8, u8) {
+    lerp_rgb((0, 231, 255), (92, 116, 168), (rank as f64 / 6.0).min(1.0))
+}
+
+/// Equalizer columns: dim teal base -> cyan -> near-white hot tip.
+fn eq_color(t: f64) -> Color {
+    if t < 0.72 {
+        rgb(lerp_rgb((16, 62, 88), (0, 224, 255), t / 0.72))
+    } else {
+        rgb(lerp_rgb((0, 224, 255), (235, 250, 255), (t - 0.72) / 0.28))
+    }
+}
+
+fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    let c = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * t).round() as u8;
+    (c(a.0, b.0), c(a.1, b.1), c(a.2, b.2))
+}
+
+fn rgb((r, g, b): (u8, u8, u8)) -> Color {
+    Color::Rgb(r, g, b)
+}
+
+// ---------------------------------------------------------------------------
+// Animation timing.
 
 const TICK: Duration = Duration::from_millis(80);
 const REFRESH: Duration = Duration::from_secs(1);
+/// Equalizer energy half-life ~1.8s (0.97^tick), peaks fall ~10%/s.
+const ENERGY_DECAY: f64 = 0.97;
+const PEAK_FALL: f64 = 0.008;
+/// Adaptive full-scale floor for the equalizer, in tokens of burst energy.
+const SCALE_FLOOR: f64 = 150_000.0;
+
+/// Per-project equalizer state, all presentation: normalized height 0..1,
+/// falling peak cap, and a phase that makes the column tops ripple.
+#[derive(Default)]
+struct BandState {
+    energy: f64,
+    height: f64,
+    peak: f64,
+    phase: f64,
+}
 
 struct App {
     snapshot: Option<Snapshot>,
     period: Period,
     vm: ViewModel,
     live: LiveStats,
-    /// Eased bar fraction per project name (presentation state only).
+    /// Eased horizontal-bar fraction per project name.
     eased: HashMap<String, f64>,
+    /// Equalizer bands per project name.
+    bands: HashMap<String, BandState>,
+    /// Last per-project token totals over the recent window, to turn
+    /// snapshot-to-snapshot deltas into band energy.
+    last_totals: HashMap<String, u64>,
+    primed: bool,
+    /// Adaptive equalizer full-scale (max burst seen, slowly decaying).
+    scale: f64,
 }
 
 impl App {
@@ -52,6 +107,10 @@ impl App {
             vm: ViewModel::default(),
             live: LiveStats::default(),
             eased: HashMap::new(),
+            bands: HashMap::new(),
+            last_totals: HashMap::new(),
+            primed: false,
+            scale: SCALE_FLOOR,
         }
     }
 
@@ -62,7 +121,25 @@ impl App {
         }
     }
 
-    /// Move eased bar positions toward their targets; true while animating.
+    /// Feed snapshot-to-snapshot token deltas into band energy. The first
+    /// snapshot only primes the baseline — startup must not read as a burst.
+    fn ingest(&mut self) {
+        let Some(snap) = &self.snapshot else { return };
+        let totals = recent_project_totals(&snap.recent);
+        if self.primed {
+            for (name, total) in &totals {
+                let prev = self.last_totals.get(name).copied().unwrap_or(0);
+                let delta = total.saturating_sub(prev);
+                if delta > 0 {
+                    self.bands.entry(name.clone()).or_default().energy += delta as f64;
+                }
+            }
+        }
+        self.last_totals = totals;
+        self.primed = true;
+    }
+
+    /// Advance all animation state one tick; true while anything is moving.
     fn animate(&mut self) -> bool {
         let mut moving = false;
         for p in &self.vm.projects {
@@ -75,6 +152,28 @@ impl App {
                 moving = true;
             }
         }
+
+        let mut max_energy: f64 = 0.0;
+        for band in self.bands.values_mut() {
+            band.energy *= ENERGY_DECAY;
+            max_energy = max_energy.max(band.energy);
+            let target = (band.energy / self.scale).powf(0.6).min(1.0);
+            // Fast attack, eased release.
+            band.height = if target > band.height {
+                target
+            } else {
+                band.height + (target - band.height) * 0.2
+            };
+            band.peak = (band.peak - PEAK_FALL).max(band.height);
+            if band.height > 0.01 {
+                band.phase += 0.38;
+                moving = true;
+            }
+        }
+        self.scale = (self.scale * 0.999).max(max_energy).max(SCALE_FLOOR);
+        self.bands.retain(|name, b| {
+            b.energy > 1.0 || b.peak > 0.02 || self.live.active_projects.contains(name)
+        });
         moving
     }
 }
@@ -92,9 +191,12 @@ pub fn run(rx: Receiver<Snapshot>) -> std::io::Result<()> {
             app.snapshot = Some(snap);
             got_new = true;
         }
+        if got_new {
+            app.ingest();
+        }
         if got_new || last_refresh.elapsed() >= REFRESH {
-            // Periodic recompute keeps the sparkline sliding and day
-            // rollover correct even with no new data.
+            // Periodic recompute keeps the sparkline sliding, activity
+            // expiring, and day rollover correct even with no new data.
             app.recompute();
             last_refresh = Instant::now();
             dirty = true;
@@ -145,11 +247,23 @@ fn set_period(app: &mut App, period: Period, dirty: &mut bool) {
 }
 
 fn draw(frame: &mut Frame, app: &App) {
-    let [header, main, footer] =
-        Layout::vertical([Constraint::Length(4), Constraint::Min(3), Constraint::Length(1)])
-            .areas(frame.area());
+    let area = frame.area();
+    frame.buffer_mut().set_style(area, Style::new().bg(BG).fg(FG));
+
+    // The equalizer gets a third of tall terminals, nothing below 20 rows.
+    let eq_h = if area.height >= 20 { (area.height / 3).clamp(7, 12) } else { 0 };
+    let [header, eq, main, footer] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(eq_h),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(area);
 
     draw_header(frame, header, app);
+    if eq_h > 0 {
+        draw_equalizer(frame, eq, app);
+    }
     if main.width >= 140 && !app.vm.models.is_empty() {
         let [left, right] =
             Layout::horizontal([Constraint::Min(60), Constraint::Length(46)]).areas(main);
@@ -172,27 +286,27 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     if scanning {
         title_spans.push(Span::styled("· scanning ~/.claude …", Style::new().fg(DIM)));
     } else if app.live.is_active {
-        title_spans.push(Span::styled("● live ", Style::new().fg(LIVE).add_modifier(Modifier::BOLD)));
-        title_spans.push(Span::styled(
-            app.live.active_projects.join(", "),
-            Style::new().fg(LIVE),
-        ));
+        title_spans
+            .push(Span::styled("● live ", Style::new().fg(LIVE).add_modifier(Modifier::BOLD)));
+        title_spans
+            .push(Span::styled(app.live.active_projects.join(", "), Style::new().fg(LIVE)));
     } else {
         title_spans.push(Span::styled("○ idle", Style::new().fg(DIM)));
     }
     let title = Line::from(title_spans);
     let badge = Line::from(vec![
         Span::styled("[ ", Style::new().fg(DIM)),
-        Span::styled(vm.period_label, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(vm.period_label, Style::new().fg(BADGE).add_modifier(Modifier::BOLD)),
         Span::styled(" ] ", Style::new().fg(DIM)),
     ])
     .right_aligned();
 
-    let today_cost = if vm.today.has_unknown_model && vm.today.known_cost == 0.0 && vm.today.records > 0 {
-        None
-    } else {
-        Some(vm.today.known_cost)
-    };
+    let today_cost =
+        if vm.today.has_unknown_model && vm.today.known_cost == 0.0 && vm.today.records > 0 {
+            None
+        } else {
+            Some(vm.today.known_cost)
+        };
     let burn = if app.live.burn_per_min >= 1.0 {
         Span::styled(
             format!("{}/min", fmt_tokens(app.live.burn_per_min as u64)),
@@ -222,9 +336,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         ),
     ]);
 
-    let block = Block::new()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::new().fg(DIM));
+    let block = Block::new().borders(Borders::BOTTOM).border_style(Style::new().fg(BORDER));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [row1, row2, row3] = Layout::vertical([
@@ -263,11 +375,131 @@ fn cost_display(vm: &ViewModel) -> Option<f64> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Equalizer: one dancing column cluster per project with recent throughput.
+
+const V_EIGHTHS: [char; 8] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇'];
+
+fn draw_equalizer(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(BORDER))
+        .title(Line::from(vec![
+            Span::styled(" streaming ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled("tok ", Style::new().fg(DIM)),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 4 || inner.width < 12 {
+        return;
+    }
+    let rows = (inner.height - 1) as usize; // last row holds the labels
+
+    // Bands: anything with visible motion plus every currently-live project
+    // (idle-but-live sessions keep a faint ember so the panel never dies).
+    let mut names: Vec<&String> = app
+        .bands
+        .iter()
+        .filter(|(name, b)| b.peak > 0.015 || app.live.active_projects.contains(name))
+        .map(|(name, _)| name)
+        .collect();
+    for name in &app.live.active_projects {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.sort_by(|a, b| {
+        let h = |n: &str| app.bands.get(n).map(|b| b.height).unwrap_or(0.0);
+        h(b).partial_cmp(&h(a)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b))
+    });
+
+    if names.is_empty() {
+        let msg = Paragraph::new(Line::from(Span::styled(
+            "· · ·  waiting for tokens  · · ·",
+            Style::new().fg(DIM),
+        )))
+        .centered();
+        let mid = Rect { y: inner.y + inner.height / 2, height: 1, ..inner };
+        frame.render_widget(msg, mid);
+        return;
+    }
+
+    let n = names.len().min((inner.width as usize / 8).max(1));
+    let names = &names[..n];
+    let slot_w = inner.width as usize / n;
+    let band_w = slot_w.saturating_sub(2).clamp(3, 14);
+
+    let empty = BandState::default();
+    let mut lines: Vec<Line> = Vec::with_capacity(rows + 1);
+    for row in 0..rows {
+        let from_bottom = (rows - 1 - row) as f64;
+        let mut spans: Vec<Span> = Vec::new();
+        for name in names {
+            let band = app.bands.get(*name).unwrap_or(&empty);
+            let active = app.live.active_projects.contains(*name);
+            // Live-but-quiet projects hold a faint ember baseline.
+            let base = if active { band.height.max(0.05) } else { band.height };
+            let peak_cell = (band.peak * rows as f64).round();
+            let left_pad = (slot_w - band_w) / 2;
+            spans.push(Span::raw(" ".repeat(left_pad)));
+            for sub in 0..band_w {
+                // Each sub-column ripples around the band height.
+                let ripple = 1.0 + 0.10 * (band.phase + sub as f64 * 1.9).sin();
+                let h = (base * ripple).clamp(0.0, 1.0) * rows as f64;
+                let filled = h - from_bottom;
+                let (ch, style) = if filled >= 1.0 {
+                    ('█', Style::new().fg(eq_color(from_bottom / rows as f64)))
+                } else if filled > 0.06 {
+                    (
+                        V_EIGHTHS[((filled * 8.0) as usize).clamp(1, 7)],
+                        Style::new().fg(eq_color(from_bottom / rows as f64)),
+                    )
+                } else if from_bottom == peak_cell && band.peak > band.height + 0.02 {
+                    ('▔', Style::new().fg(PEAK))
+                } else {
+                    (' ', Style::new())
+                };
+                spans.push(Span::styled(ch.to_string(), style));
+            }
+            spans.push(Span::raw(" ".repeat(slot_w - left_pad - band_w)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Label row: centered project names, live dot for active ones.
+    let mut labels: Vec<Span> = Vec::new();
+    for name in names {
+        let active = app.live.active_projects.contains(*name);
+        let max_name = slot_w.saturating_sub(3).max(1);
+        let mut label: String = name.chars().take(max_name).collect();
+        if name.chars().count() > max_name {
+            label.pop();
+            label.push('…');
+        }
+        let display_len = label.chars().count() + 2; // dot + space
+        let left = (slot_w.saturating_sub(display_len)) / 2;
+        labels.push(Span::raw(" ".repeat(left)));
+        labels.push(if active {
+            Span::styled("● ", Style::new().fg(LIVE))
+        } else {
+            Span::styled("○ ", Style::new().fg(DIM))
+        });
+        labels.push(Span::styled(
+            label,
+            Style::new().fg(if active { FG } else { DIM }).add_modifier(Modifier::BOLD),
+        ));
+        labels.push(Span::raw(" ".repeat(slot_w.saturating_sub(left + display_len))));
+    }
+    lines.push(Line::from(labels));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_projects(frame: &mut Frame, area: Rect, app: &App) {
     let vm = &app.vm;
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(DIM))
+        .border_style(Style::new().fg(BORDER))
         .title(Line::from(vec![
             Span::styled(" projects ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
             Span::styled(format!("({}) ", vm.projects.len()), Style::new().fg(DIM)),
@@ -326,20 +558,22 @@ fn draw_projects(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw("  ")
         };
         let frac = app.eased.get(&p.name).copied().unwrap_or(p.frac);
-        let color = BAR_RAMP[i.min(BAR_RAMP.len() - 1)];
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             dot,
             Span::styled(
                 format!("{name:<name_w$}"),
-                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::new().fg(FG).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(bar(frac, bar_w), Style::new().fg(color)),
+        ];
+        spans.extend(gradient_bar(frac, bar_w, i));
+        spans.extend([
             Span::raw("  "),
             Span::styled(format!("{:>tokens_w$}", fmt_tokens(p.tokens)), Style::new().fg(ACCENT)),
             Span::raw("  "),
             Span::styled(format!("{:>cost_w$}", fmt_cost(p.est_cost)), Style::new().fg(MONEY)),
-        ]));
+        ]);
+        lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -348,7 +582,7 @@ fn draw_models(frame: &mut Frame, area: Rect, app: &App) {
     let vm = &app.vm;
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(DIM))
+        .border_style(Style::new().fg(BORDER))
         .title(Line::from(Span::styled(
             " models ",
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -363,7 +597,7 @@ fn draw_models(frame: &mut Frame, area: Rect, app: &App) {
         .take(inner.height as usize)
         .map(|m| {
             Line::from(vec![
-                Span::styled(format!("{:<24}", m.name), Style::new().fg(Color::White)),
+                Span::styled(format!("{:<24}", m.name), Style::new().fg(FG)),
                 Span::styled(format!("{:>8}", fmt_tokens(m.tokens)), Style::new().fg(ACCENT)),
                 Span::styled(format!("{:>9}", fmt_cost(m.est_cost)), Style::new().fg(MONEY)),
             ])
@@ -377,7 +611,7 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
     for (key, label) in [("d", "today"), ("w", "7 days"), ("m", "30 days"), ("q", "quit")] {
         spans.push(Span::styled(
             format!(" {key} "),
-            Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::new().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(format!(" {label}   "), Style::new().fg(DIM)));
     }
@@ -393,17 +627,30 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
     }
 }
 
-/// Unicode block bar with 1/8-cell resolution.
-fn bar(frac: f64, width: usize) -> String {
+/// Horizontal unicode-block bar with 1/8-cell resolution and a per-cell
+/// base->tip color gradient.
+fn gradient_bar(frac: f64, width: usize, rank: usize) -> Vec<Span<'static>> {
     const PARTIALS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let tip = bar_tip(rank);
     let eighths = (frac.clamp(0.0, 1.0) * (width * 8) as f64).round() as usize;
     let full = eighths / 8;
     let rem = eighths % 8;
-    let mut s = "█".repeat(full);
-    if rem > 0 && full < width {
-        s.push(PARTIALS[rem]);
+
+    let mut spans: Vec<Span> = Vec::with_capacity(full + 2);
+    let color_at = |cell: usize| {
+        let t = if width <= 1 { 1.0 } else { cell as f64 / (width - 1) as f64 };
+        rgb(lerp_rgb(BAR_BASE, tip, t))
+    };
+    for cell in 0..full {
+        spans.push(Span::styled("█", Style::new().fg(color_at(cell))));
     }
-    let pad = width.saturating_sub(s.chars().count());
-    s.push_str(&" ".repeat(pad));
-    s
+    let mut used = full;
+    if rem > 0 && full < width {
+        spans.push(Span::styled(PARTIALS[rem].to_string(), Style::new().fg(color_at(full))));
+        used += 1;
+    }
+    if used < width {
+        spans.push(Span::raw(" ".repeat(width - used)));
+    }
+    spans
 }
