@@ -58,7 +58,7 @@ impl App {
     fn recompute(&mut self) {
         if let Some(snap) = &self.snapshot {
             self.vm = view(&snap.cube, self.period, Local::now().date_naive());
-            self.live = live_stats(&snap.recent, chrono::Utc::now());
+            self.live = live_stats(&snap.recent, &snap.activity, chrono::Utc::now());
         }
     }
 

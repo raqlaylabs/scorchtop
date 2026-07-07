@@ -39,6 +39,9 @@ and `XDG_DATA_HOME` (isolates the history write path).
   `output_tokens` → totals grow only by the output delta.
 - Write isolation: after quit, `find $SANDBOX/home/.claude -type f` shows only
   your fixtures; history lands in `$SANDBOX/xdg/agentop/history/daily.json`.
+- Activity signal: append a `{"type":"user",...}` line (no usage) → project
+  must flip to `● live` within ~1s (activity is mtime-based, not record-based).
+  Backdate a file with `touch -t` before launch → must NOT show live at startup.
 
 ## Oracle (data correctness)
 

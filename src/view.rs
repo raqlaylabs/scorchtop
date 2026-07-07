@@ -132,24 +132,31 @@ fn cost_of(t: &Totals) -> Option<f64> {
     }
 }
 
-/// Live activity derived from recent (deduplicated) records.
+/// Live activity derived from recent records and per-project write times.
 #[derive(Debug, Default)]
 pub struct LiveStats {
     /// Total tokens per minute over the last hour, oldest bucket first.
     pub minute_tokens: Vec<u64>,
     /// Average tokens/min over the last 5 minutes.
     pub burn_per_min: f64,
-    /// Projects (display names) with a record in the last 2 minutes.
+    /// Projects (display names) whose files were written recently.
     pub active_projects: Vec<String>,
     pub is_active: bool,
 }
 
-/// Compute sparkline/burn/activity from records of roughly the last hour.
-/// `now` is injected for testability.
-pub fn live_stats(recent: &[crate::source::UsageRecord], now: chrono::DateTime<chrono::Utc>) -> LiveStats {
+/// A session mid-task can go minutes between writes (one long tool run emits
+/// nothing until it finishes), so "live" tolerates a 3-minute silence.
+const ACTIVE_WINDOW_SECS: i64 = 180;
+
+/// Compute sparkline/burn from records of roughly the last hour, and the
+/// active set from per-project last-write times (file mtimes — see
+/// `ProjectActivity`). `now` is injected for testability.
+pub fn live_stats(
+    recent: &[crate::source::UsageRecord],
+    activity: &[crate::watch::ProjectActivity],
+    now: chrono::DateTime<chrono::Utc>,
+) -> LiveStats {
     let mut stats = LiveStats { minute_tokens: vec![0; 60], ..Default::default() };
-    let active_cutoff = now - chrono::Duration::seconds(120);
-    let mut active: std::collections::BTreeSet<String> = Default::default();
 
     for r in recent {
         let age_min = (now - r.timestamp).num_seconds() as f64 / 60.0;
@@ -157,13 +164,13 @@ pub fn live_stats(recent: &[crate::source::UsageRecord], now: chrono::DateTime<c
             let bucket = 59 - age_min.floor() as usize;
             stats.minute_tokens[bucket] += r.usage.total();
         }
-        if r.timestamp >= active_cutoff && r.timestamp <= now {
-            let name = r
-                .cwd
-                .as_deref()
-                .and_then(|c| c.rsplit('/').find(|s| !s.is_empty()))
-                .unwrap_or(&r.project_key);
-            active.insert(name.to_string());
+    }
+
+    let active_cutoff = now - chrono::Duration::seconds(ACTIVE_WINDOW_SECS);
+    let mut active: std::collections::BTreeSet<String> = Default::default();
+    for a in activity {
+        if a.last_write >= active_cutoff {
+            active.insert(a.name.clone());
         }
     }
 
@@ -289,8 +296,16 @@ mod tests {
             usage: TokenUsage { input: total, output: 0, cache_create: 0, cache_read: 0 },
         };
 
+        let act = |name: &str, secs_ago: i64| crate::watch::ProjectActivity {
+            name: name.into(),
+            last_write: now - chrono::Duration::seconds(secs_ago),
+        };
+
         let records = vec![rec(1, 500), rec(30, 200), rec(90, 999)];
-        let stats = live_stats(&records, now);
+        // alpha wrote 170s ago (inside the 3-min window even though its last
+        // usage record could be older); beta went quiet 4 min ago.
+        let activity = vec![act("alpha", 170), act("beta", 240)];
+        let stats = live_stats(&records, &activity, now);
 
         assert_eq!(stats.minute_tokens.len(), 60);
         assert_eq!(stats.minute_tokens[58], 500); // 1 min ago
@@ -300,7 +315,7 @@ mod tests {
         assert!(stats.is_active);
         assert_eq!(stats.active_projects, vec!["alpha".to_string()]);
 
-        let idle = live_stats(&[rec(30, 200)], now);
+        let idle = live_stats(&[rec(30, 200)], &[act("alpha", 240)], now);
         assert!(!idle.is_active);
         assert!(idle.active_projects.is_empty());
     }

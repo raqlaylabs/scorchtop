@@ -19,13 +19,24 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use notify::{RecursiveMode, Watcher};
 
 use crate::aggregate::{cube_from, dedup, Cube};
 use crate::history;
 use crate::lines::LineBuffer;
-use crate::source::claude_code::{parse_line, LineOutcome};
+use crate::source::claude_code::{display_name_from_key, parse_line, LineOutcome};
 use crate::source::{ScanStats, UsageRecord};
+
+/// Last observed write per project. Activity is keyed off file mtimes, not
+/// usage-record timestamps: an agent mid-task can go minutes between usage
+/// records (long tool runs) while still writing tool-result lines, and at
+/// startup mtimes tell us who was just active before we launched.
+#[derive(Debug, Clone)]
+pub struct ProjectActivity {
+    pub name: String,
+    pub last_write: DateTime<Utc>,
+}
 
 /// What the UI receives: everything it needs to render, precomputed except
 /// for period filtering (a pure `view()` call).
@@ -33,8 +44,10 @@ pub struct Snapshot {
     /// (project, day, model) cube, merged with persisted history.
     pub cube: Cube,
     /// Deduplicated records from the last ~75 minutes, for the tokens/min
-    /// sparkline, burn rate, and active-session indicators.
+    /// sparkline and burn rate.
     pub recent: Vec<UsageRecord>,
+    /// Per-project last write time, for the live/idle indicators.
+    pub activity: Vec<ProjectActivity>,
     pub stats: ScanStats,
     pub duplicates_skipped: u64,
 }
@@ -53,11 +66,23 @@ pub struct Tailer {
     states: HashMap<PathBuf, TailState>,
     pub records: Vec<UsageRecord>,
     pub malformed_lines: u64,
+    /// project key -> newest file mtime seen. Any write counts, including
+    /// line types the parser skips (tool results, attachments).
+    arrivals: HashMap<String, DateTime<Utc>>,
+    /// project key -> display name, learned from parsed records' `cwd`.
+    names: HashMap<String, String>,
 }
 
 impl Tailer {
     pub fn new(root: PathBuf) -> Self {
-        Self { root, states: HashMap::new(), records: Vec::new(), malformed_lines: 0 }
+        Self {
+            root,
+            states: HashMap::new(),
+            records: Vec::new(),
+            malformed_lines: 0,
+            arrivals: HashMap::new(),
+            names: HashMap::new(),
+        }
     }
 
     pub fn files_seen(&self) -> usize {
@@ -76,42 +101,65 @@ impl Tailer {
 
     /// Tail one file: read bytes past the stored offset, consume complete
     /// lines. Handles truncation (offset beyond EOF) by restarting the file.
-    pub fn read_path(&mut self, path: &Path, probe_tail: bool) {
+    /// Returns true if anything observable changed (new bytes or a newer
+    /// mtime), so the caller knows a fresh snapshot is worth sending.
+    pub fn read_path(&mut self, path: &Path, probe_tail: bool) -> bool {
         let Some(project_key) = project_key_of(&self.root, path) else {
-            return;
+            return false;
         };
         let state = self.states.entry(path.to_path_buf()).or_insert(TailState {
-            project_key,
+            project_key: project_key.clone(),
             offset: 0,
             buf: LineBuffer::new(),
         });
 
         // open -> seek -> read -> close; never keep a handle on Claude Code's files.
         let Ok(mut file) = File::open(path) else {
-            return;
+            return false;
         };
-        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let meta = file.metadata().ok();
+        let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+
+        // Any write to the file marks its project active, even if every new
+        // line is a type the parser skips.
+        let mut changed = false;
+        if let Some(mtime) = meta.and_then(|m| m.modified().ok()) {
+            let mtime = DateTime::<Utc>::from(mtime);
+            let slot = self.arrivals.entry(project_key).or_insert(mtime);
+            if mtime > *slot {
+                *slot = mtime;
+                changed = true;
+            }
+        }
+
         if len < state.offset {
             // Truncated/rewritten: restart from the top.
             state.offset = 0;
             state.buf.clear();
         }
         if len == state.offset {
-            return;
+            return changed;
         }
         if file.seek(SeekFrom::Start(state.offset)).is_err() {
-            return;
+            return changed;
         }
         let mut bytes = Vec::new();
         if file.read_to_end(&mut bytes).is_err() {
-            return;
+            return changed;
         }
         drop(file);
         state.offset += bytes.len() as u64;
 
         for line in state.buf.push(&bytes) {
             match parse_line(&line, &state.project_key) {
-                LineOutcome::Record(r) => self.records.push(*r),
+                LineOutcome::Record(r) => {
+                    if let Some(cwd) = &r.cwd {
+                        if let Some(name) = cwd.rsplit('/').find(|s| !s.is_empty()) {
+                            self.names.insert(state.project_key.clone(), name.to_string());
+                        }
+                    }
+                    self.records.push(*r);
+                }
                 LineOutcome::Skipped => {}
                 LineOutcome::Malformed => self.malformed_lines += 1,
             }
@@ -123,6 +171,7 @@ impl Tailer {
                 }
             }
         }
+        true
     }
 
     /// Build a snapshot: dedup, merge with history, slice recent records.
@@ -135,9 +184,22 @@ impl Tailer {
             .filter(|r| r.timestamp >= cutoff)
             .map(|r| (*r).clone())
             .collect();
+        let activity = self
+            .arrivals
+            .iter()
+            .map(|(key, last_write)| ProjectActivity {
+                name: self
+                    .names
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| display_name_from_key(key)),
+                last_write: *last_write,
+            })
+            .collect();
         Snapshot {
             cube,
             recent,
+            activity,
             stats: ScanStats {
                 files_scanned: self.files_seen(),
                 malformed_lines: self.malformed_lines,
@@ -235,11 +297,13 @@ pub fn run(root: PathBuf, history_dir: Option<PathBuf>, tx: Sender<Snapshot>) {
         changed.sort();
         changed.dedup();
 
-        let before = tailer.records.len();
+        // Send on any observable change — tool-result writes carry no usage
+        // records but do flip a project to "live".
+        let mut touched = false;
         for path in &changed {
-            tailer.read_path(path, false);
+            touched |= tailer.read_path(path, false);
         }
-        if tailer.records.len() != before && tx.send(tailer.snapshot(&stored)).is_err() {
+        if touched && tx.send(tailer.snapshot(&stored)).is_err() {
             return; // UI closed
         }
     }
@@ -315,6 +379,33 @@ mod tests {
         tailer.read_path(&file, false);
         assert_eq!(tailer.records.len(), 2);
         assert_eq!(tailer.records[1].message_id.as_deref(), Some("msg_B"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn skipped_line_writes_still_mark_project_active() {
+        let root = temp_root("activity");
+        let file = root.join("-u-alpha").join("s.jsonl");
+        fs::write(&file, format!("{LINE_A}\n")).unwrap();
+
+        let mut tailer = Tailer::new(root.clone());
+        tailer.scan_all(false);
+        let before = tailer.snapshot(&Cube::new());
+        assert_eq!(before.activity.len(), 1, "startup seeds activity from mtime");
+        let t0 = before.activity[0].last_write;
+
+        // A tool-result write: parser skips it, but the project is clearly live.
+        std::thread::sleep(Duration::from_millis(1100)); // mtime granularity
+        let mut f = fs::OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"role":"user"}}}}"#).unwrap();
+        drop(f);
+
+        assert!(tailer.read_path(&file, false), "skipped-only write must report a change");
+        let after = tailer.snapshot(&Cube::new());
+        assert_eq!(after.activity.len(), 1);
+        assert!(after.activity[0].last_write > t0, "last_write must advance");
+        assert_eq!(after.activity[0].name, "alpha", "display name comes from records' cwd");
 
         fs::remove_dir_all(&root).unwrap();
     }
