@@ -1,23 +1,27 @@
-//! Ratatui dashboard. Dumb by design: draws a `ViewModel` and forwards
-//! keystrokes — every number it shows was computed in `view.rs`.
+//! Ratatui dashboard. Dumb by design: it renders `Snapshot`s delivered over
+//! the mpsc channel plus pure `view()` / `live_stats()` results — every
+//! number it shows was computed in the aggregation layer. The only state it
+//! owns is presentation: the selected period and bar-easing positions.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Sparkline};
 use ratatui::Frame;
 
-use crate::aggregate::Cube;
-use crate::source::ScanStats;
-use crate::view::{fmt_cost, fmt_tokens, view, Period, ViewModel};
+use crate::view::{fmt_cost, fmt_tokens, live_stats, view, LiveStats, Period, ViewModel};
+use crate::watch::Snapshot;
 
 const ACCENT: Color = Color::Cyan;
 const MONEY: Color = Color::Green;
 const DIM: Color = Color::DarkGray;
+const LIVE: Color = Color::LightGreen;
 /// Cyan -> blue ramp for bars, by project rank.
 const BAR_RAMP: [Color; 6] = [
     Color::Indexed(51),
@@ -28,36 +32,85 @@ const BAR_RAMP: [Color; 6] = [
     Color::Indexed(61),
 ];
 
-pub struct App {
-    cube: Cube,
-    stats: ScanStats,
+const TICK: Duration = Duration::from_millis(80);
+const REFRESH: Duration = Duration::from_secs(1);
+
+struct App {
+    snapshot: Option<Snapshot>,
     period: Period,
     vm: ViewModel,
+    live: LiveStats,
+    /// Eased bar fraction per project name (presentation state only).
+    eased: HashMap<String, f64>,
 }
 
 impl App {
-    pub fn new(cube: Cube, stats: ScanStats) -> Self {
-        let period = Period::Day;
-        let vm = view(&cube, period, Local::now().date_naive());
-        Self { cube, stats, period, vm }
+    fn new() -> Self {
+        Self {
+            snapshot: None,
+            period: Period::Day,
+            vm: ViewModel::default(),
+            live: LiveStats::default(),
+            eased: HashMap::new(),
+        }
     }
 
-    fn set_period(&mut self, period: Period) {
-        self.period = period;
-        self.vm = view(&self.cube, period, Local::now().date_naive());
+    fn recompute(&mut self) {
+        if let Some(snap) = &self.snapshot {
+            self.vm = view(&snap.cube, self.period, Local::now().date_naive());
+            self.live = live_stats(&snap.recent, chrono::Utc::now());
+        }
+    }
+
+    /// Move eased bar positions toward their targets; true while animating.
+    fn animate(&mut self) -> bool {
+        let mut moving = false;
+        for p in &self.vm.projects {
+            let slot = self.eased.entry(p.name.clone()).or_insert(0.0);
+            let delta = p.frac - *slot;
+            if delta.abs() < 0.004 {
+                *slot = p.frac;
+            } else {
+                *slot += delta * 0.25;
+                moving = true;
+            }
+        }
+        moving
     }
 }
 
-pub fn run(cube: Cube, stats: ScanStats) -> std::io::Result<()> {
+pub fn run(rx: Receiver<Snapshot>) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
-    let mut app = App::new(cube, stats);
+    let mut app = App::new();
+    let mut dirty = true;
+    let mut last_refresh = Instant::now();
+
     let result = loop {
-        if let Err(e) = terminal.draw(|frame| draw(frame, &app)) {
-            break Err(e);
+        // Drain the channel; keep only the newest snapshot.
+        let mut got_new = false;
+        while let Ok(snap) = rx.try_recv() {
+            app.snapshot = Some(snap);
+            got_new = true;
         }
-        // Static dashboard: block briefly for input; live updates arrive in
-        // Milestone 3 via the watcher channel.
-        match event::poll(Duration::from_millis(250)) {
+        if got_new || last_refresh.elapsed() >= REFRESH {
+            // Periodic recompute keeps the sparkline sliding and day
+            // rollover correct even with no new data.
+            app.recompute();
+            last_refresh = Instant::now();
+            dirty = true;
+        }
+        if app.animate() {
+            dirty = true;
+        }
+
+        if dirty {
+            if let Err(e) = terminal.draw(|frame| draw(frame, &app)) {
+                break Err(e);
+            }
+            dirty = false;
+        }
+
+        match event::poll(TICK) {
             Ok(true) => {
                 if let Ok(Event::Key(key)) = event::read() {
                     if key.kind != KeyEventKind::Press {
@@ -68,11 +121,13 @@ pub fn run(cube: Cube, stats: ScanStats) -> std::io::Result<()> {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             break Ok(())
                         }
-                        KeyCode::Char('d') => app.set_period(Period::Day),
-                        KeyCode::Char('w') => app.set_period(Period::Week),
-                        KeyCode::Char('m') => app.set_period(Period::Month),
+                        KeyCode::Char('d') => set_period(&mut app, Period::Day, &mut dirty),
+                        KeyCode::Char('w') => set_period(&mut app, Period::Week, &mut dirty),
+                        KeyCode::Char('m') => set_period(&mut app, Period::Month, &mut dirty),
                         _ => {}
                     }
+                } else {
+                    dirty = true; // resize etc.
                 }
             }
             Ok(false) => {}
@@ -83,14 +138,18 @@ pub fn run(cube: Cube, stats: ScanStats) -> std::io::Result<()> {
     result
 }
 
+fn set_period(app: &mut App, period: Period, dirty: &mut bool) {
+    app.period = period;
+    app.recompute();
+    *dirty = true;
+}
+
 fn draw(frame: &mut Frame, app: &App) {
     let [header, main, footer] =
-        Layout::vertical([Constraint::Length(3), Constraint::Min(3), Constraint::Length(1)])
+        Layout::vertical([Constraint::Length(4), Constraint::Min(3), Constraint::Length(1)])
             .areas(frame.area());
 
     draw_header(frame, header, app);
-    // Wide terminals get a models side panel; narrow ones keep full width
-    // for the project bars.
     if main.width >= 140 && !app.vm.models.is_empty() {
         let [left, right] =
             Layout::horizontal([Constraint::Min(60), Constraint::Length(46)]).areas(main);
@@ -104,22 +163,24 @@ fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let vm = &app.vm;
-    let title = Line::from(vec![
+    let scanning = app.snapshot.is_none();
+
+    let mut title_spans = vec![
         Span::styled(" agentop ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(format!("v{} ", env!("CARGO_PKG_VERSION")), Style::new().fg(DIM)),
-        Span::styled(
-            format!(
-                "· claude code · {} files{}",
-                app.stats.files_scanned,
-                if app.stats.malformed_lines > 0 {
-                    format!(" · {} malformed", app.stats.malformed_lines)
-                } else {
-                    String::new()
-                }
-            ),
-            Style::new().fg(DIM),
-        ),
-    ]);
+    ];
+    if scanning {
+        title_spans.push(Span::styled("· scanning ~/.claude …", Style::new().fg(DIM)));
+    } else if app.live.is_active {
+        title_spans.push(Span::styled("● live ", Style::new().fg(LIVE).add_modifier(Modifier::BOLD)));
+        title_spans.push(Span::styled(
+            app.live.active_projects.join(", "),
+            Style::new().fg(LIVE),
+        ));
+    } else {
+        title_spans.push(Span::styled("○ idle", Style::new().fg(DIM)));
+    }
+    let title = Line::from(title_spans);
     let badge = Line::from(vec![
         Span::styled("[ ", Style::new().fg(DIM)),
         Span::styled(vm.period_label, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -127,19 +188,28 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .right_aligned();
 
-    let today_cost = fmt_cost(if vm.today.records == 0 && !vm.today.has_unknown_model {
-        Some(0.0)
-    } else if vm.today.has_unknown_model && vm.today.known_cost == 0.0 {
+    let today_cost = if vm.today.has_unknown_model && vm.today.known_cost == 0.0 && vm.today.records > 0 {
         None
     } else {
         Some(vm.today.known_cost)
-    });
+    };
+    let burn = if app.live.burn_per_min >= 1.0 {
+        Span::styled(
+            format!("{}/min", fmt_tokens(app.live.burn_per_min as u64)),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("—/min", Style::new().fg(DIM))
+    };
     let stats = Line::from(vec![
         Span::styled(" today ", Style::new().fg(DIM)),
-        Span::styled(today_cost, Style::new().fg(MONEY).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" · {} tok", fmt_tokens(vm.today.tokens.total())), Style::new().fg(ACCENT)),
+        Span::styled(fmt_cost(today_cost), Style::new().fg(MONEY).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" · {} tok", fmt_tokens(vm.today.tokens.total())),
+            Style::new().fg(ACCENT),
+        ),
         Span::styled("   burn ", Style::new().fg(DIM)),
-        Span::styled("—/min", Style::new().fg(DIM)),
+        burn,
         Span::styled("   Σ ", Style::new().fg(DIM)),
         Span::styled(fmt_cost(cost_display(vm)), Style::new().fg(MONEY)),
         Span::styled(
@@ -154,15 +224,35 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 
     let block = Block::new()
         .borders(Borders::BOTTOM)
-        .border_type(BorderType::Plain)
         .border_style(Style::new().fg(DIM));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [row1, row2] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    let [row1, row2, row3] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
     frame.render_widget(Paragraph::new(title), row1);
     frame.render_widget(Paragraph::new(badge), row1);
     frame.render_widget(Paragraph::new(stats), row2);
+    draw_sparkline(frame, row3, app);
+}
+
+fn draw_sparkline(frame: &mut Frame, area: Rect, app: &App) {
+    let [label_area, spark_area] =
+        Layout::horizontal([Constraint::Length(14), Constraint::Min(10)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(" tok/min · 1h ", Style::new().fg(DIM)))),
+        label_area,
+    );
+    let data = &app.live.minute_tokens;
+    let width = spark_area.width as usize;
+    let slice = if data.len() > width { &data[data.len() - width..] } else { &data[..] };
+    frame.render_widget(
+        Sparkline::default().data(slice).style(Style::new().fg(ACCENT)),
+        spark_area,
+    );
 }
 
 fn cost_display(vm: &ViewModel) -> Option<f64> {
@@ -189,7 +279,11 @@ fn draw_projects(frame: &mut Frame, area: Rect, app: &App) {
     if vm.projects.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("no usage in {}", vm.period_label),
+                if app.snapshot.is_none() {
+                    "scanning…".to_string()
+                } else {
+                    format!("no usage in {}", vm.period_label)
+                },
                 Style::new().fg(DIM),
             ))),
             inner,
@@ -206,7 +300,8 @@ fn draw_projects(frame: &mut Frame, area: Rect, app: &App) {
         .clamp(8, 20);
     let tokens_w = 8usize;
     let cost_w = 9usize;
-    let bar_w = (inner.width as usize).saturating_sub(name_w + tokens_w + cost_w + 6);
+    // name + activity dot + gaps + tokens + cost
+    let bar_w = (inner.width as usize).saturating_sub(name_w + 2 + tokens_w + cost_w + 6);
 
     let visible = inner.height as usize;
     let mut lines: Vec<Line> = Vec::new();
@@ -224,11 +319,22 @@ fn draw_projects(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             p.name.clone()
         };
+        let active = app.live.active_projects.iter().any(|a| a == &p.name);
+        let dot = if active {
+            Span::styled("● ", Style::new().fg(LIVE))
+        } else {
+            Span::raw("  ")
+        };
+        let frac = app.eased.get(&p.name).copied().unwrap_or(p.frac);
         let color = BAR_RAMP[i.min(BAR_RAMP.len() - 1)];
         lines.push(Line::from(vec![
-            Span::styled(format!("{name:<name_w$}"), Style::new().fg(Color::White).add_modifier(Modifier::BOLD)),
+            dot,
+            Span::styled(
+                format!("{name:<name_w$}"),
+                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(bar(p.frac, bar_w), Style::new().fg(color)),
+            Span::styled(bar(frac, bar_w), Style::new().fg(color)),
             Span::raw("  "),
             Span::styled(format!("{:>tokens_w$}", fmt_tokens(p.tokens)), Style::new().fg(ACCENT)),
             Span::raw("  "),

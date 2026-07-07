@@ -28,6 +28,22 @@ impl LineBuffer {
         lines
     }
 
+    /// Non-consuming view of the buffered partial line, if any. Lets a full
+    /// scan probe-parse a file that doesn't end in `\n` while keeping the
+    /// bytes buffered in case more arrive later.
+    pub fn partial_str(&self) -> Option<String> {
+        if self.partial.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&self.partial).into_owned())
+        }
+    }
+
+    /// Drop any buffered partial bytes (used when a file is truncated).
+    pub fn clear(&mut self) {
+        self.partial.clear();
+    }
+
     /// The buffered partial line, if any. Used at end-of-file during a full
     /// scan, where a file that simply doesn't end in `\n` may still hold one
     /// complete final line.

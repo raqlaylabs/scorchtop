@@ -47,11 +47,18 @@ fn load() -> Loaded {
 
 fn main() {
     let cli = Cli::parse();
-    let loaded = load();
     match cli.command {
-        Some(Command::Dump { json }) => dump(&loaded, json),
+        Some(Command::Dump { json }) => dump(&load(), json),
         None => {
-            if let Err(e) = agentop::ui::run(loaded.cube, loaded.stats) {
+            // Live dashboard: watcher/parser thread -> mpsc -> UI thread.
+            let Some(source) = ClaudeCodeSource::new() else {
+                eprintln!("could not locate home directory");
+                std::process::exit(1);
+            };
+            let root = source.root().to_path_buf();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || agentop::watch::run(root, history::default_dir(), tx));
+            if let Err(e) = agentop::ui::run(rx) {
                 eprintln!("terminal error: {e}");
                 std::process::exit(1);
             }

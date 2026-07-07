@@ -42,21 +42,20 @@ pub struct DedupCube {
     pub duplicates_skipped: u64,
 }
 
-/// Deduplicate on (`message.id`, `requestId`) and bucket by project, local
-/// day, and model. Records missing either id are kept as-is (a dedup key
-/// exists only when both are present).
+/// Deduplicate on (`message.id`, `requestId`). Records missing either id are
+/// kept as-is (a dedup key exists only when both are present).
 ///
 /// Streaming writes the same message several times with *growing*
 /// `output_tokens`; the final occurrence carries the true count, so among
 /// duplicates the record with the largest output wins.
-pub fn build_cube<'a>(records: impl IntoIterator<Item = &'a UsageRecord>) -> DedupCube {
-    let mut keyed: HashMap<(String, String), &UsageRecord> = HashMap::new();
+pub fn dedup(records: &[UsageRecord]) -> (Vec<&UsageRecord>, u64) {
+    let mut keyed: HashMap<(&str, &str), &UsageRecord> = HashMap::new();
     let mut survivors: Vec<&UsageRecord> = Vec::new();
     let mut duplicates_skipped = 0;
 
     for record in records {
         if let (Some(mid), Some(rid)) = (&record.message_id, &record.request_id) {
-            match keyed.entry((mid.clone(), rid.clone())) {
+            match keyed.entry((mid, rid)) {
                 Entry::Occupied(mut e) => {
                     duplicates_skipped += 1;
                     if record.usage.output > e.get().usage.output {
@@ -72,9 +71,13 @@ pub fn build_cube<'a>(records: impl IntoIterator<Item = &'a UsageRecord>) -> Ded
         }
     }
     survivors.extend(keyed.into_values());
+    (survivors, duplicates_skipped)
+}
 
+/// Bucket already-deduplicated records by (project, local day, model).
+pub fn cube_from<'a>(records: impl IntoIterator<Item = &'a UsageRecord>) -> Cube {
     let mut cube = Cube::new();
-    for record in survivors {
+    for record in records {
         let key = CubeKey {
             project: record.project_key.clone(),
             date: record.timestamp.with_timezone(&Local).date_naive(),
@@ -96,8 +99,13 @@ pub fn build_cube<'a>(records: impl IntoIterator<Item = &'a UsageRecord>) -> Ded
                 crate::source::claude_code::display_name_from_key(&record.project_key);
         }
     }
+    cube
+}
 
-    DedupCube { cube, duplicates_skipped }
+/// Dedup + bucket in one call.
+pub fn build_cube(records: &[UsageRecord]) -> DedupCube {
+    let (survivors, duplicates_skipped) = dedup(records);
+    DedupCube { cube: cube_from(survivors), duplicates_skipped }
 }
 
 /// Rolled-up usage for one bucket (a day, a project, a model, or the total).
@@ -156,7 +164,7 @@ pub fn rollup(cube: &Cube, duplicates_skipped: u64) -> Aggregates {
 }
 
 /// Convenience: dedup + bucket + roll up in one call.
-pub fn aggregate<'a>(records: impl IntoIterator<Item = &'a UsageRecord>) -> Aggregates {
+pub fn aggregate(records: &[UsageRecord]) -> Aggregates {
     let d = build_cube(records);
     rollup(&d.cube, d.duplicates_skipped)
 }
@@ -217,7 +225,7 @@ mod tests {
     fn unknown_model_counts_tokens_but_flags_cost() {
         let mut r = record(Some("m1"), Some("r1"), 100);
         r.model = "mystery-model-9".into();
-        let agg = aggregate(std::iter::once(&r));
+        let agg = aggregate(std::slice::from_ref(&r));
         assert_eq!(agg.totals.tokens.input, 100);
         assert!(agg.totals.has_unknown_model);
         assert_eq!(agg.totals.known_cost, 0.0);

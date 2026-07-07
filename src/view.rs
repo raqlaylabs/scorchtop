@@ -132,6 +132,48 @@ fn cost_of(t: &Totals) -> Option<f64> {
     }
 }
 
+/// Live activity derived from recent (deduplicated) records.
+#[derive(Debug, Default)]
+pub struct LiveStats {
+    /// Total tokens per minute over the last hour, oldest bucket first.
+    pub minute_tokens: Vec<u64>,
+    /// Average tokens/min over the last 5 minutes.
+    pub burn_per_min: f64,
+    /// Projects (display names) with a record in the last 2 minutes.
+    pub active_projects: Vec<String>,
+    pub is_active: bool,
+}
+
+/// Compute sparkline/burn/activity from records of roughly the last hour.
+/// `now` is injected for testability.
+pub fn live_stats(recent: &[crate::source::UsageRecord], now: chrono::DateTime<chrono::Utc>) -> LiveStats {
+    let mut stats = LiveStats { minute_tokens: vec![0; 60], ..Default::default() };
+    let active_cutoff = now - chrono::Duration::seconds(120);
+    let mut active: std::collections::BTreeSet<String> = Default::default();
+
+    for r in recent {
+        let age_min = (now - r.timestamp).num_seconds() as f64 / 60.0;
+        if (0.0..60.0).contains(&age_min) {
+            let bucket = 59 - age_min.floor() as usize;
+            stats.minute_tokens[bucket] += r.usage.total();
+        }
+        if r.timestamp >= active_cutoff && r.timestamp <= now {
+            let name = r
+                .cwd
+                .as_deref()
+                .and_then(|c| c.rsplit('/').find(|s| !s.is_empty()))
+                .unwrap_or(&r.project_key);
+            active.insert(name.to_string());
+        }
+    }
+
+    let last5: u64 = stats.minute_tokens[55..].iter().sum();
+    stats.burn_per_min = last5 as f64 / 5.0;
+    stats.is_active = !active.is_empty();
+    stats.active_projects = active.into_iter().collect();
+    stats
+}
+
 /// "12.3M", "986k", "1.2B" — compact token counts for tight columns.
 pub fn fmt_tokens(n: u64) -> String {
     let f = n as f64;
@@ -228,6 +270,39 @@ mod tests {
         let vm = view(&cube, Period::Day, day("2026-07-06"));
         assert_eq!(vm.projects[0].est_cost, None);
         assert_eq!(fmt_cost(vm.projects[0].est_cost), "—");
+    }
+
+    #[test]
+    fn live_stats_buckets_by_minute_and_flags_activity() {
+        use crate::source::UsageRecord;
+        use chrono::{TimeZone, Utc};
+
+        let now = Utc.with_ymd_and_hms(2026, 7, 6, 12, 0, 0).unwrap();
+        let rec = |mins_ago: i64, total: u64| UsageRecord {
+            project_key: "-u-alpha".into(),
+            cwd: Some("/u/alpha".into()),
+            session_id: None,
+            timestamp: now - chrono::Duration::minutes(mins_ago),
+            model: "m".into(),
+            message_id: None,
+            request_id: None,
+            usage: TokenUsage { input: total, output: 0, cache_create: 0, cache_read: 0 },
+        };
+
+        let records = vec![rec(1, 500), rec(30, 200), rec(90, 999)];
+        let stats = live_stats(&records, now);
+
+        assert_eq!(stats.minute_tokens.len(), 60);
+        assert_eq!(stats.minute_tokens[58], 500); // 1 min ago
+        assert_eq!(stats.minute_tokens[29], 200); // 30 min ago
+        assert_eq!(stats.minute_tokens.iter().sum::<u64>(), 700); // 90-min-old excluded
+        assert!((stats.burn_per_min - 100.0).abs() < 1e-9); // 500 over last 5 min
+        assert!(stats.is_active);
+        assert_eq!(stats.active_projects, vec!["alpha".to_string()]);
+
+        let idle = live_stats(&[rec(30, 200)], now);
+        assert!(!idle.is_active);
+        assert!(idle.active_projects.is_empty());
     }
 
     #[test]
