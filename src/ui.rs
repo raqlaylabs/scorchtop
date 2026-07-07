@@ -42,6 +42,34 @@ fn bar_tip(rank: usize) -> (u8, u8, u8) {
     lerp_rgb((0, 231, 255), (92, 116, 168), (rank as f64 / 6.0).min(1.0))
 }
 
+/// Model-family colors for the split-by-model bar mode and the models panel.
+fn model_color(model: &str) -> Color {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") || m.contains("fable") || m.contains("mythos") {
+        Color::Rgb(192, 132, 252) // violet
+    } else if m.contains("sonnet") {
+        Color::Rgb(56, 214, 240) // cyan
+    } else if m.contains("haiku") {
+        Color::Rgb(74, 222, 128) // green
+    } else {
+        Color::Rgb(125, 135, 150) // unknown/other
+    }
+}
+
+/// Family label for the legend ("opus", "sonnet", ...).
+fn model_family(model: &str) -> &'static str {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") || m.contains("fable") || m.contains("mythos") {
+        "opus"
+    } else if m.contains("sonnet") {
+        "sonnet"
+    } else if m.contains("haiku") {
+        "haiku"
+    } else {
+        "other"
+    }
+}
+
 /// Equalizer columns: dim teal base -> cyan -> near-white hot tip.
 fn eq_color(t: f64) -> Color {
     if t < 0.72 {
@@ -97,6 +125,8 @@ struct App {
     primed: bool,
     /// Adaptive equalizer full-scale (max burst seen, slowly decaying).
     scale: f64,
+    /// Color project bars by model share instead of the rank gradient.
+    split_by_model: bool,
 }
 
 impl App {
@@ -111,6 +141,7 @@ impl App {
             last_totals: HashMap::new(),
             primed: false,
             scale: SCALE_FLOOR,
+            split_by_model: false,
         }
     }
 
@@ -226,6 +257,10 @@ pub fn run(rx: Receiver<Snapshot>) -> std::io::Result<()> {
                         KeyCode::Char('d') => set_period(&mut app, Period::Day, &mut dirty),
                         KeyCode::Char('w') => set_period(&mut app, Period::Week, &mut dirty),
                         KeyCode::Char('m') => set_period(&mut app, Period::Month, &mut dirty),
+                        KeyCode::Char('x') => {
+                            app.split_by_model = !app.split_by_model;
+                            dirty = true;
+                        }
                         _ => {}
                     }
                 } else {
@@ -264,7 +299,7 @@ fn draw(frame: &mut Frame, app: &App) {
     if eq_h > 0 {
         draw_equalizer(frame, eq, app);
     }
-    if main.width >= 140 && !app.vm.models.is_empty() {
+    if main.width >= 110 && !app.vm.models.is_empty() {
         let [left, right] =
             Layout::horizontal([Constraint::Min(60), Constraint::Length(46)]).areas(main);
         draw_projects(frame, left, app);
@@ -515,13 +550,27 @@ fn draw_equalizer(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_projects(frame: &mut Frame, area: Rect, app: &App) {
     let vm = &app.vm;
+    let mut title_spans = vec![
+        Span::styled(" projects ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("({}) ", vm.projects.len()), Style::new().fg(DIM)),
+    ];
+    if app.split_by_model {
+        // Legend: one dot per model family present in the period.
+        let mut seen: Vec<&'static str> = Vec::new();
+        for m in &vm.models {
+            let fam = model_family(&m.name);
+            if !seen.contains(&fam) {
+                seen.push(fam);
+                title_spans.push(Span::styled("· ", Style::new().fg(DIM)));
+                title_spans.push(Span::styled("■ ", Style::new().fg(model_color(&m.name))));
+                title_spans.push(Span::styled(format!("{fam} "), Style::new().fg(DIM)));
+            }
+        }
+    }
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(BORDER))
-        .title(Line::from(vec![
-            Span::styled(" projects ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("({}) ", vm.projects.len()), Style::new().fg(DIM)),
-        ]))
+        .title(Line::from(title_spans))
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -584,7 +633,11 @@ fn draw_projects(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Span::raw("  "),
         ];
-        spans.extend(gradient_bar(frac, bar_w, i));
+        if app.split_by_model {
+            spans.extend(stacked_bar(frac, bar_w, &p.models, p.tokens));
+        } else {
+            spans.extend(gradient_bar(frac, bar_w, i));
+        }
         spans.extend([
             Span::raw("  "),
             Span::styled(format!("{:>tokens_w$}", fmt_tokens(p.tokens)), Style::new().fg(ACCENT)),
@@ -615,7 +668,8 @@ fn draw_models(frame: &mut Frame, area: Rect, app: &App) {
         .take(inner.height as usize)
         .map(|m| {
             Line::from(vec![
-                Span::styled(format!("{:<24}", m.name), Style::new().fg(FG)),
+                Span::styled("■ ", Style::new().fg(model_color(&m.name))),
+                Span::styled(format!("{:<22}", m.name), Style::new().fg(FG)),
                 Span::styled(format!("{:>8}", fmt_tokens(m.tokens)), Style::new().fg(ACCENT)),
                 Span::styled(format!("{:>9}", fmt_cost(m.est_cost)), Style::new().fg(MONEY)),
             ])
@@ -626,7 +680,9 @@ fn draw_models(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_footer(frame: &mut Frame, area: Rect) {
     let mut spans = Vec::new();
-    for (key, label) in [("d", "today"), ("w", "7 days"), ("m", "30 days"), ("q", "quit")] {
+    for (key, label) in
+        [("d", "today"), ("w", "7 days"), ("m", "30 days"), ("x", "models"), ("q", "quit")]
+    {
         spans.push(Span::styled(
             format!(" {key} "),
             Style::new().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD),
@@ -643,6 +699,58 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
     if area.width >= 100 {
         frame.render_widget(Paragraph::new(note), area);
     }
+}
+
+/// Horizontal bar partitioned into model-colored segments (cell resolution,
+/// eighth-precision on the trailing edge).
+fn stacked_bar(
+    frac: f64,
+    width: usize,
+    models: &[(String, u64)],
+    total: u64,
+) -> Vec<Span<'static>> {
+    const PARTIALS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let eighths = (frac.clamp(0.0, 1.0) * (width * 8) as f64).round() as usize;
+    let full = eighths / 8;
+    let rem = eighths % 8;
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut used = 0usize;
+    if total > 0 && full > 0 {
+        // Whole-cell segments per model, largest first; last one absorbs
+        // rounding so the bar length always matches the gradient mode.
+        let mut cells: Vec<(usize, Color)> = models
+            .iter()
+            .map(|(m, t)| {
+                ((*t as f64 / total as f64 * full as f64).round() as usize, model_color(m))
+            })
+            .collect();
+        let assigned: usize = cells.iter().map(|(c, _)| *c).sum();
+        if let Some(last) = cells.last_mut() {
+            last.0 = (last.0 + full).saturating_sub(assigned);
+        }
+        for (count, color) in cells {
+            let count = count.min(full - used);
+            if count > 0 {
+                spans.push(Span::styled("█".repeat(count), Style::new().fg(color)));
+                used += count;
+            }
+        }
+        if used < full {
+            let color = models.first().map(|(m, _)| model_color(m)).unwrap_or(DIM);
+            spans.push(Span::styled("█".repeat(full - used), Style::new().fg(color)));
+            used = full;
+        }
+    }
+    if rem > 0 && used < width {
+        let color = models.last().map(|(m, _)| model_color(m)).unwrap_or(DIM);
+        spans.push(Span::styled(PARTIALS[rem].to_string(), Style::new().fg(color)));
+        used += 1;
+    }
+    if used < width {
+        spans.push(Span::raw(" ".repeat(width - used)));
+    }
+    spans
 }
 
 /// Horizontal unicode-block bar with 1/8-cell resolution and a per-cell

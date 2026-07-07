@@ -40,6 +40,8 @@ pub struct ProjectRow {
     pub est_cost: Option<f64>,
     /// Bar length relative to the largest project in the view (0.0..=1.0).
     pub frac: f64,
+    /// Per-model tokens within this project, sorted descending.
+    pub models: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +75,8 @@ pub fn view(cube: &Cube, period: Period, today: NaiveDate) -> ViewModel {
         ..Default::default()
     };
 
-    let mut projects: std::collections::BTreeMap<String, (String, Totals)> = Default::default();
+    type ProjectAcc = (String, Totals, std::collections::BTreeMap<String, u64>);
+    let mut projects: std::collections::BTreeMap<String, ProjectAcc> = Default::default();
     let mut models: std::collections::BTreeMap<String, Totals> = Default::default();
     let mut days: std::collections::BTreeSet<NaiveDate> = Default::default();
 
@@ -89,22 +92,28 @@ pub fn view(cube: &Cube, period: Period, today: NaiveDate) -> ViewModel {
         }
         vm.period.add_entry(entry);
         days.insert(key.date);
-        let (name, totals) = projects.entry(key.project.clone()).or_default();
+        let (name, totals, by_model) = projects.entry(key.project.clone()).or_default();
         if !entry.display_name.is_empty() {
             *name = entry.display_name.clone();
         }
         totals.add_entry(entry);
+        *by_model.entry(key.model.clone()).or_insert(0) += entry.tokens.total();
         models.entry(key.model.clone()).or_default().add_entry(entry);
     }
     vm.active_days = days.len();
 
     vm.projects = projects
         .into_values()
-        .map(|(name, t)| ProjectRow {
-            name,
-            tokens: t.tokens.total(),
-            est_cost: cost_of(&t),
-            frac: 0.0,
+        .map(|(name, t, by_model)| {
+            let mut models: Vec<(String, u64)> = by_model.into_iter().collect();
+            models.sort_by_key(|(_, tokens)| std::cmp::Reverse(*tokens));
+            ProjectRow {
+                name,
+                tokens: t.tokens.total(),
+                est_cost: cost_of(&t),
+                frac: 0.0,
+                models,
+            }
         })
         .collect();
     vm.projects.sort_by_key(|p| std::cmp::Reverse(p.tokens));
@@ -272,10 +281,16 @@ mod tests {
         let mut cube = Cube::new();
         insert(&mut cube, "-small", "2026-07-06", "m", 100, Some(1.0));
         insert(&mut cube, "-big", "2026-07-06", "m", 400, Some(4.0));
+        insert(&mut cube, "-big", "2026-07-06", "m2", 100, Some(1.0));
         let vm = view(&cube, Period::Day, day("2026-07-06"));
         assert_eq!(vm.projects[0].name, "big");
         assert!((vm.projects[0].frac - 1.0).abs() < 1e-9);
-        assert!((vm.projects[1].frac - 0.25).abs() < 1e-9);
+        assert!((vm.projects[1].frac - 0.2).abs() < 1e-9);
+        // Per-project model breakdown, sorted by tokens descending.
+        assert_eq!(
+            vm.projects[0].models,
+            vec![("m".to_string(), 400), ("m2".to_string(), 100)]
+        );
     }
 
     #[test]
