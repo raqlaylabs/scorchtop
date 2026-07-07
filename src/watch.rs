@@ -75,6 +75,10 @@ pub struct Tailer {
 
 impl Tailer {
     pub fn new(root: PathBuf) -> Self {
+        // FSEvents/inotify report resolved real paths; if the root contains a
+        // symlink (macOS: /tmp -> /private/tmp), event paths would never match
+        // it and every live update would be silently dropped.
+        let root = root.canonicalize().unwrap_or(root);
         Self {
             root,
             states: HashMap::new(),
@@ -104,6 +108,18 @@ impl Tailer {
     /// Returns true if anything observable changed (new bytes or a newer
     /// mtime), so the caller knows a fresh snapshot is worth sending.
     pub fn read_path(&mut self, path: &Path, probe_tail: bool) -> bool {
+        // Callers may hand us the same file under a symlinked spelling;
+        // resolve so it maps to the root and keys a single TailState.
+        let resolved;
+        let path = if project_key_of(&self.root, path).is_some() {
+            path
+        } else {
+            let Ok(p) = path.canonicalize() else {
+                return false;
+            };
+            resolved = p;
+            &resolved
+        };
         let Some(project_key) = project_key_of(&self.root, path) else {
             return false;
         };
@@ -247,6 +263,7 @@ fn project_key_of(root: &Path, path: &Path) -> Option<String> {
 /// bursts for ~200ms before sending a fresh snapshot. Exits when the UI
 /// drops its receiver.
 pub fn run(root: PathBuf, history_dir: Option<PathBuf>, tx: Sender<Snapshot>) {
+    let root = root.canonicalize().unwrap_or(root);
     let mut tailer = Tailer::new(root.clone());
     tailer.scan_all(true);
 
@@ -381,6 +398,22 @@ mod tests {
         assert_eq!(tailer.records[1].message_id.as_deref(), Some("msg_B"));
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn event_paths_with_resolved_symlinks_still_match_the_root() {
+        // macOS temp dirs live behind symlinks (/tmp -> /private/tmp); the
+        // watcher delivers resolved paths, so the tailer must canonicalize.
+        let root = temp_root("symlink");
+        let file = root.join("-u-alpha").join("s.jsonl");
+        fs::write(&file, format!("{LINE_A}\n")).unwrap();
+
+        let mut tailer = Tailer::new(root.clone());
+        let resolved = file.canonicalize().unwrap();
+        assert!(tailer.read_path(&resolved, false));
+        assert_eq!(tailer.records.len(), 1, "resolved event path must map to a project");
+
+        fs::remove_dir_all(root.canonicalize().unwrap()).unwrap();
     }
 
     #[test]
