@@ -172,6 +172,9 @@ pub fn parse_line(line: &str, project_key: &str) -> LineOutcome {
         TurnSignal::Neutral
     } else {
         match raw.kind.as_deref() {
+            // An interrupted request ends the turn: Claude was stopped and no
+            // assistant end_turn will ever arrive.
+            Some("user") if line.contains("[Request interrupted") => TurnSignal::TurnEnded,
             Some("user") => TurnSignal::Working,
             Some("assistant") => {
                 let ended = raw
@@ -283,6 +286,14 @@ mod tests {
         assert!(matches!(
             parse_line(r#"{"type":"file-history-snapshot"}"#, "p"),
             LineOutcome::Skipped(TurnSignal::Neutral)
+        ));
+        // An interrupted request ends the turn even though it's a user line.
+        assert!(matches!(
+            parse_line(
+                r#"{"type":"user","message":{"content":"[Request interrupted by user]"}}"#,
+                "p"
+            ),
+            LineOutcome::Skipped(TurnSignal::TurnEnded)
         ));
     }
 

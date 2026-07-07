@@ -60,8 +60,11 @@ struct TailState {
     offset: u64,
     buf: LineBuffer,
     /// Whether this session is mid-turn: set by user lines (prompts, tool
-    /// results), cleared by an assistant `end_turn`.
+    /// results), cleared by an assistant `end_turn` or interrupt marker.
     working: bool,
+    /// This file's own mtime — the crash guard must be per session, or one
+    /// stale mid-turn file keeps its whole project "live" forever.
+    last_write: DateTime<Utc>,
 }
 
 /// Incremental tailer over `<root>/<project>/**/*.jsonl`. Accumulates raw
@@ -133,6 +136,7 @@ impl Tailer {
             offset: 0,
             buf: LineBuffer::new(),
             working: false,
+            last_write: DateTime::<Utc>::MIN_UTC,
         });
 
         // open -> seek -> read -> close; never keep a handle on Claude Code's files.
@@ -147,6 +151,9 @@ impl Tailer {
         let mut changed = false;
         if let Some(mtime) = meta.and_then(|m| m.modified().ok()) {
             let mtime = DateTime::<Utc>::from(mtime);
+            if mtime > state.last_write {
+                state.last_write = mtime;
+            }
             let slot = self.arrivals.entry(project_key).or_insert(mtime);
             if mtime > *slot {
                 *slot = mtime;
@@ -213,24 +220,33 @@ impl Tailer {
             .filter(|r| r.timestamp >= cutoff)
             .map(|r| (*r).clone())
             .collect();
-        // A project is mid-turn if any of its sessions is.
-        let mut working: std::collections::HashSet<&str> = Default::default();
+        // A project is mid-turn if any of its sessions is. Report the newest
+        // write among its *working* sessions, so the staleness guard judges
+        // the file that claims to be working — one abandoned mid-turn
+        // transcript must not ride on a sibling session's fresh mtime.
+        let mut working: HashMap<&str, DateTime<Utc>> = HashMap::new();
         for state in self.states.values() {
             if state.working {
-                working.insert(&state.project_key);
+                let newest = working.entry(state.project_key.as_str()).or_insert(state.last_write);
+                if state.last_write > *newest {
+                    *newest = state.last_write;
+                }
             }
         }
         let activity = self
             .arrivals
             .iter()
-            .map(|(key, last_write)| ProjectActivity {
-                name: self
-                    .names
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| display_name_from_key(key)),
-                working: working.contains(key.as_str()),
-                last_write: *last_write,
+            .map(|(key, last_write)| {
+                let work = working.get(key.as_str()).copied();
+                ProjectActivity {
+                    name: self
+                        .names
+                        .get(key)
+                        .cloned()
+                        .unwrap_or_else(|| display_name_from_key(key)),
+                    working: work.is_some(),
+                    last_write: work.unwrap_or(*last_write),
+                }
             })
             .collect();
         Snapshot {
@@ -469,6 +485,37 @@ mod tests {
         drop(f);
         assert!(tailer.read_path(&file, false), "skipped-only write must report a change");
         assert!(tailer.snapshot(&Cube::new()).activity[0].working, "user line => working");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stale_mid_turn_session_cannot_ride_a_siblings_fresh_mtime() {
+        let root = temp_root("stale");
+        let dir = root.join("-u-alpha");
+
+        // Session 1: abandoned mid-turn (user line, no end_turn), 20 min old.
+        let stale = dir.join("stale.jsonl");
+        fs::write(&stale, format!("{LINE_A}\n{{\"type\":\"user\",\"message\":{{}}}}\n")).unwrap();
+        let f = fs::OpenOptions::new().write(true).open(&stale).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(1200)).unwrap();
+        drop(f);
+
+        // Session 2: finished cleanly just now.
+        let done = LINE_B.replace(r#""model""#, r#""stop_reason":"end_turn","model""#);
+        fs::write(dir.join("fresh.jsonl"), format!("{done}\n")).unwrap();
+
+        let mut tailer = Tailer::new(root.clone());
+        tailer.scan_all(false);
+        let snap = tailer.snapshot(&Cube::new());
+        assert_eq!(snap.activity.len(), 1);
+        let a = &snap.activity[0];
+        assert!(a.working, "the stale session is still nominally mid-turn");
+        let age = chrono::Utc::now() - a.last_write;
+        assert!(
+            age >= chrono::Duration::minutes(19),
+            "last_write must come from the working file, not the fresh sibling (age {age})"
+        );
 
         fs::remove_dir_all(&root).unwrap();
     }
