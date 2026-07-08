@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod cast;
 pub mod history;
 pub mod lines;
 pub mod pricing;

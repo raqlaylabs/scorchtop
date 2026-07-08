@@ -878,6 +878,9 @@ fn stacked_bar(
 
 /// Entrance animation length.
 const WRAP_ANIM: Duration = Duration::from_millis(800);
+/// In-app `.cast` recording: offline render rate and settle hold.
+const CAST_FPS: f64 = 30.0;
+const CAST_HOLD_SECS: f64 = 1.5;
 
 fn ease_out(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
@@ -904,10 +907,13 @@ pub fn run_wrapped(
     let mut model = wrapped::wrapped(&cube, &refs, month);
     let mut terminal = ratatui::init();
     let mut opened = Instant::now();
+    let mut notice: Option<String> = None;
 
     let result = loop {
         let t = (opened.elapsed().as_secs_f64() / WRAP_ANIM.as_secs_f64()).min(1.0);
-        if let Err(e) = terminal.draw(|frame| draw_wrapped(frame, &model, blur, t)) {
+        if let Err(e) =
+            terminal.draw(|frame| draw_wrapped(frame, &model, blur, t, notice.as_deref()))
+        {
             break Err(e);
         }
         // Tick while animating; once settled, block until the next key
@@ -916,24 +922,41 @@ pub fn run_wrapped(
         match event::poll(timeout) {
             Ok(false) => {} // animation tick
             Ok(true) => match event::read() {
-                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        break Ok(())
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                    notice = None;
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break Ok(())
+                        }
+                        KeyCode::Left | KeyCode::Char('h') if month > earliest => {
+                            month = month.prev();
+                            model = wrapped::wrapped(&cube, &refs, month);
+                            opened = Instant::now(); // replay the entrance
+                        }
+                        KeyCode::Right | KeyCode::Char('l') if month < current => {
+                            month = month.next();
+                            model = wrapped::wrapped(&cube, &refs, month);
+                            opened = Instant::now();
+                        }
+                        KeyCode::Char('b') => blur = !blur,
+                        KeyCode::Char('r') => {
+                            let name = format!(
+                                "agentop-wrapped-{}.cast",
+                                model.label.to_lowercase().replace(' ', "-")
+                            );
+                            notice = Some(match terminal
+                                .size()
+                                .and_then(|s| record_wrapped_cast(&model, blur, s, name.as_ref()))
+                            {
+                                Ok(()) => format!("● saved ./{name} — gif: agg {name} out.gif"),
+                                Err(e) => format!("record failed: {e}"),
+                            });
+                            opened = Instant::now(); // mirror the recording on screen
+                        }
+                        _ => {}
                     }
-                    KeyCode::Left | KeyCode::Char('h') if month > earliest => {
-                        month = month.prev();
-                        model = wrapped::wrapped(&cube, &refs, month);
-                        opened = Instant::now(); // replay the entrance
-                    }
-                    KeyCode::Right | KeyCode::Char('l') if month < current => {
-                        month = month.next();
-                        model = wrapped::wrapped(&cube, &refs, month);
-                        opened = Instant::now();
-                    }
-                    KeyCode::Char('b') => blur = !blur,
-                    _ => {}
-                },
+                }
                 Ok(_) => {} // resize etc: fall through to redraw
                 Err(e) => break Err(e),
             },
@@ -944,7 +967,38 @@ pub fn run_wrapped(
     result
 }
 
-fn draw_wrapped(frame: &mut Frame, model: &WrappedModel, blur: bool, t: f64) {
+/// Render the entrance animation for the current view into an off-screen
+/// buffer at a fixed frame rate and write it as an asciinema cast in the
+/// working directory. No screen capture involved, so the result is always
+/// smooth regardless of terminal or load.
+fn record_wrapped_cast(
+    model: &WrappedModel,
+    blur: bool,
+    size: ratatui::layout::Size,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    let backend = ratatui::backend::TestBackend::new(size.width, size.height);
+    let mut term = ratatui::Terminal::new(backend)?;
+    let steps = (WRAP_ANIM.as_secs_f64() * CAST_FPS).ceil() as usize;
+    let mut frames: Vec<(f64, String)> = Vec::with_capacity(steps + 2);
+    for i in 0..=steps {
+        let t = i as f64 / steps as f64;
+        term.draw(|frame| draw_wrapped(frame, model, blur, t, None))?;
+        frames.push((i as f64 / CAST_FPS, crate::cast::frame_to_ansi(term.backend().buffer())));
+    }
+    // Hold the settled scorecard so the loop doesn't cut straight to black.
+    let settled = frames.last().expect("at least one frame").1.clone();
+    frames.push((WRAP_ANIM.as_secs_f64() + CAST_HOLD_SECS, settled));
+    crate::cast::write_cast(path, size.width, size.height, &frames)
+}
+
+fn draw_wrapped(
+    frame: &mut Frame,
+    model: &WrappedModel,
+    blur: bool,
+    t: f64,
+    notice: Option<&str>,
+) {
     let area = frame.area();
     frame.buffer_mut().set_style(area, Style::new().bg(BG).fg(FG));
 
@@ -970,7 +1024,7 @@ fn draw_wrapped(frame: &mut Frame, model: &WrappedModel, blur: bool, t: f64) {
         draw_wrapped_heatmap(frame, heat, model, t);
         draw_wrapped_projects(frame, projects, model, blur, t);
     }
-    draw_wrapped_footer(frame, footer);
+    draw_wrapped_footer(frame, footer, notice);
 }
 
 fn draw_wrapped_header(frame: &mut Frame, area: Rect, model: &WrappedModel, blur: bool, t: f64) {
@@ -1233,9 +1287,22 @@ fn draw_wrapped_projects(frame: &mut Frame, area: Rect, model: &WrappedModel, bl
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_wrapped_footer(frame: &mut Frame, area: Rect) {
+fn draw_wrapped_footer(frame: &mut Frame, area: Rect, notice: Option<&str>) {
+    // A fresh recording confirmation replaces the hints until the next key.
+    if let Some(msg) = notice {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {msg}"),
+                Style::new().fg(BADGE).add_modifier(Modifier::BOLD),
+            ))),
+            area,
+        );
+        return;
+    }
     let mut spans = Vec::new();
-    for (key, label) in [("◂ ▸", "month"), ("b", "blur names"), ("q", "quit")] {
+    for (key, label) in
+        [("◂ ▸", "month"), ("b", "blur names"), ("r", "record .cast"), ("q", "quit")]
+    {
         spans.push(Span::styled(
             format!(" {key} "),
             Style::new().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD),

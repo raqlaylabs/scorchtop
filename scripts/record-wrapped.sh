@@ -66,14 +66,17 @@ emit "$LAST_MONTH" 14 nebula claude-opus-4-8 60
 
 # --- record -----------------------------------------------------------------
 # vhs's tape parser rejects absolute Output paths; record relative to the
-# sandbox and move the result afterwards.
+# sandbox and move the results afterwards. GIF for README inlining, MP4 for
+# crisp full-color sharing (GitHub embeds mp4 natively).
 TAPE="$SB/wrapped.tape"
 cat > "$TAPE" <<EOF
 Output wrapped-demo.gif
-Set FontSize 15
-Set Width 1100
-Set Height 640
-Set Padding 10
+Output wrapped-demo.mp4
+Set FontSize 22
+Set Width 1600
+Set Height 900
+Set Padding 12
+Set Framerate 60
 Set TypingSpeed 40ms
 Hide
 Type "export HOME='$SB/home' XDG_DATA_HOME='$SB/xdg' PATH='$REPO/target/release':\$PATH; clear"
@@ -94,4 +97,5 @@ EOF
 
 (cd "$SB" && vhs "$TAPE")
 mv "$SB/wrapped-demo.gif" "$OUT"
-echo "wrote $OUT"
+mv "$SB/wrapped-demo.mp4" "${OUT%.gif}.mp4"
+echo "wrote $OUT and ${OUT%.gif}.mp4"
