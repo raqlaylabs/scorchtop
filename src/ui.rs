@@ -13,7 +13,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Sparkline};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Sparkline};
 use ratatui::Frame;
 
 use crate::view::{
@@ -150,6 +150,8 @@ struct App {
     split_by_model: bool,
     /// Show recent turns instead of models in the right-side panel.
     show_turns: bool,
+    /// Keybind help overlay.
+    show_help: bool,
 }
 
 impl App {
@@ -166,6 +168,7 @@ impl App {
             scale: SCALE_FLOOR,
             split_by_model: false,
             show_turns: false,
+            show_help: false,
         }
     }
 
@@ -282,10 +285,23 @@ pub fn run(rx: Receiver<Snapshot>) -> std::io::Result<()> {
                         continue;
                     }
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             break Ok(())
                         }
+                        KeyCode::Char('?') => {
+                            app.show_help = !app.show_help;
+                            dirty = true;
+                        }
+                        // While help is open, any other key just closes it
+                        // (except quit, which still quits).
+                        _ if app.show_help => {
+                            app.show_help = false;
+                            dirty = true;
+                            if matches!(key.code, KeyCode::Char('q')) {
+                                break Ok(());
+                            }
+                        }
+                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                         KeyCode::Char('d') => set_period(&mut app, Period::Day, &mut dirty),
                         KeyCode::Char('w') => set_period(&mut app, Period::Week, &mut dirty),
                         KeyCode::Char('m') => set_period(&mut app, Period::Month, &mut dirty),
@@ -350,6 +366,87 @@ fn draw(frame: &mut Frame, app: &App) {
         draw_projects(frame, main, app, widen_hint);
     }
     draw_footer(frame, footer);
+    if app.show_help {
+        draw_help(frame, area, DASHBOARD_HELP, DASHBOARD_HELP_NOTES);
+    }
+}
+
+const DASHBOARD_HELP: &[(&str, &str)] = &[
+    ("d / w / m", "today · last 7 days · last 30 days"),
+    ("x", "color bars by model share"),
+    ("t", "turns panel: prompt → tokens → lines"),
+    ("?", "toggle this help"),
+    ("q · esc", "quit"),
+];
+const DASHBOARD_HELP_NOTES: &[&str] = &[
+    "$ figures are est. API value at public rates,",
+    "not what your subscription charges.",
+    "~/.claude is read-only; scorchtop state lives",
+    "in ~/.local/share/scorchtop.",
+];
+
+const WRAPPED_HELP: &[(&str, &str)] = &[
+    ("◂ / ▸", "previous / next month"),
+    ("b", "blur project names"),
+    ("r", "record the entrance as a GIF"),
+    ("?", "toggle this help"),
+    ("q · esc", "quit"),
+];
+const WRAPPED_HELP_NOTES: &[&str] = &[
+    "blur swaps names for rank-stable pseudonyms",
+    "(project-a is the top project) — safe to share.",
+];
+
+/// Centered keybind cheat-sheet painted over the current screen.
+fn draw_help(frame: &mut Frame, area: Rect, keys: &[(&str, &str)], notes: &[&str]) {
+    let key_w = keys.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+    let content_w = keys
+        .iter()
+        .map(|(_, d)| key_w + 2 + d.chars().count())
+        .chain(notes.iter().map(|n| n.chars().count()))
+        .max()
+        .unwrap_or(20) as u16;
+    let content_h = (keys.len() + if notes.is_empty() { 0 } else { notes.len() + 1 }) as u16;
+    let w = (content_w + 6).min(area.width);
+    let h = (content_h + 4).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .style(Style::new().bg(BG).fg(FG))
+        .title(Line::from(Span::styled(
+            " help ",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = keys
+        .iter()
+        .map(|(k, d)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{k:<key_w$}"),
+                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(*d, Style::new().fg(FG)),
+            ])
+        })
+        .collect();
+    if !notes.is_empty() {
+        lines.push(Line::default());
+        lines.extend(notes.iter().map(|n| Line::from(Span::styled(*n, Style::new().fg(DIM)))));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -797,6 +894,7 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
         ("m", "30 days"),
         ("x", "models"),
         ("t", "turns"),
+        ("?", "help"),
         ("q", "quit"),
     ] {
         spans.push(Span::styled(
@@ -912,11 +1010,12 @@ pub fn run_wrapped(
     let mut terminal = ratatui::init();
     let mut opened = Instant::now();
     let mut notice: Option<String> = None;
+    let mut help = false;
 
     let result = loop {
         let t = (opened.elapsed().as_secs_f64() / WRAP_ANIM.as_secs_f64()).min(1.0);
         if let Err(e) =
-            terminal.draw(|frame| draw_wrapped(frame, &model, blur, t, notice.as_deref()))
+            terminal.draw(|frame| draw_wrapped(frame, &model, blur, t, notice.as_deref(), help))
         {
             break Err(e);
         }
@@ -929,10 +1028,19 @@ pub fn run_wrapped(
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     notice = None;
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             break Ok(())
                         }
+                        KeyCode::Char('?') => help = !help,
+                        // While help is open, any other key closes it
+                        // (except quit, which still quits).
+                        _ if help => {
+                            help = false;
+                            if matches!(key.code, KeyCode::Char('q')) {
+                                break Ok(());
+                            }
+                        }
+                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                         KeyCode::Left | KeyCode::Char('h') if month > earliest => {
                             month = month.prev();
                             model = wrapped::wrapped(&cube, &refs, month);
@@ -988,7 +1096,7 @@ fn record_wrapped_gif(
     let mut frames: Vec<(u16, ratatui::buffer::Buffer)> = Vec::with_capacity(steps + 2);
     for i in 0..=steps {
         let t = i as f64 / steps as f64;
-        term.draw(|frame| draw_wrapped(frame, model, blur, t, None))?;
+        term.draw(|frame| draw_wrapped(frame, model, blur, t, None, false))?;
         frames.push((delay_cs, term.backend().buffer().clone()));
     }
     // Hold the settled scorecard so the loop doesn't cut straight to black.
@@ -1004,6 +1112,7 @@ fn draw_wrapped(
     blur: bool,
     t: f64,
     notice: Option<&str>,
+    help: bool,
 ) {
     let area = frame.area();
     frame.buffer_mut().set_style(area, Style::new().bg(BG).fg(FG));
@@ -1031,6 +1140,9 @@ fn draw_wrapped(
         draw_wrapped_projects(frame, projects, model, blur, t);
     }
     draw_wrapped_footer(frame, footer, notice);
+    if help {
+        draw_help(frame, area, WRAPPED_HELP, WRAPPED_HELP_NOTES);
+    }
 }
 
 fn draw_wrapped_header(frame: &mut Frame, area: Rect, model: &WrappedModel, blur: bool, t: f64) {
@@ -1306,9 +1418,13 @@ fn draw_wrapped_footer(frame: &mut Frame, area: Rect, notice: Option<&str>) {
         return;
     }
     let mut spans = Vec::new();
-    for (key, label) in
-        [("◂ ▸", "month"), ("b", "blur names"), ("r", "record gif"), ("q", "quit")]
-    {
+    for (key, label) in [
+        ("◂ ▸", "month"),
+        ("b", "blur names"),
+        ("r", "record gif"),
+        ("?", "help"),
+        ("q", "quit"),
+    ] {
         spans.push(Span::styled(
             format!(" {key} "),
             Style::new().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD),

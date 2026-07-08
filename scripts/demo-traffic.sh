@@ -25,8 +25,9 @@ echo "  HOME=$SANDBOX/home XDG_DATA_HOME=$SANDBOX/xdg ./target/debug/scorchtop"
 echo
 echo "streaming fake traffic (ctrl-c to stop)…"
 
-emit() {
+emit() { # $1 project  $2 optional stop_reason
   local project="$1"
+  local stop="${2:-}"
   local model="${MODELS[$((RANDOM % ${#MODELS[@]}))]}"
   local ts in out cw cr
   ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
@@ -34,8 +35,19 @@ emit() {
   out=$((RANDOM % 8000 + 200))
   cw=$((RANDOM % 30000))
   cr=$((RANDOM % 400000 + 20000))
-  printf '{"type":"assistant","requestId":"req_%s%s","timestamp":"%s","cwd":"/tmp/%s","sessionId":"demo","message":{"id":"msg_%s%s","model":"%s","usage":{"input_tokens":%d,"output_tokens":%d,"cache_creation_input_tokens":%d,"cache_read_input_tokens":%d}}}\n' \
-    "$RANDOM" "$RANDOM" "$ts" "$project" "$RANDOM" "$RANDOM" "$model" "$in" "$out" "$cw" "$cr" \
+  [ -n "$stop" ] && stop="\"stop_reason\":\"$stop\","
+  printf '{"type":"assistant","requestId":"req_%s%s","timestamp":"%s","cwd":"/tmp/%s","sessionId":"demo","message":{"id":"msg_%s%s",%s"model":"%s","usage":{"input_tokens":%d,"output_tokens":%d,"cache_creation_input_tokens":%d,"cache_read_input_tokens":%d}}}\n' \
+    "$RANDOM" "$RANDOM" "$ts" "$project" "$RANDOM" "$RANDOM" "$stop" "$model" "$in" "$out" "$cw" "$cr" \
+    >> "$ROOT/-tmp-$project/demo.jsonl"
+}
+
+# A user prompt opens a turn: the project reads as ● live until end_turn.
+emit_prompt() {
+  local project="$1"
+  local ts
+  ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  printf '{"type":"user","timestamp":"%s","cwd":"/tmp/%s","sessionId":"demo","message":{"role":"user","content":"demo prompt %s"}}\n' \
+    "$ts" "$project" "$RANDOM" \
     >> "$ROOT/-tmp-$project/demo.jsonl"
 }
 
@@ -43,6 +55,7 @@ while true; do
   # One project bursts hard, the others trickle — feels like real sessions.
   hot="${PROJECTS[$((RANDOM % ${#PROJECTS[@]}))]}"
   burst=$((RANDOM % 6 + 2))
+  emit_prompt "$hot"
   for _ in $(seq "$burst"); do
     emit "$hot"
     if (( RANDOM % 3 == 0 )); then
@@ -50,5 +63,6 @@ while true; do
     fi
     sleep "0.$((RANDOM % 6 + 2))"
   done
+  emit "$hot" end_turn
   sleep "$((RANDOM % 3)).$((RANDOM % 9))"
 done
