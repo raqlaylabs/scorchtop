@@ -1,6 +1,6 @@
 [package]
 name = "scorchtop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "btop for AI coding agents — live Claude Code token usage dashboard"
 license = "MIT"
