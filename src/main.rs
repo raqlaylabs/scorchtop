@@ -21,10 +21,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Monthly shareable summary: heatmap, top projects, biggest session.
+    Wrapped {
+        /// Start with project names replaced by pseudonyms (screenshot-safe).
+        #[arg(long)]
+        blur: bool,
+    },
 }
 
 struct Loaded {
     cube: Cube,
+    records: Vec<agentop::source::UsageRecord>,
     stats: ScanStats,
     duplicates_skipped: u64,
 }
@@ -42,13 +49,25 @@ fn load() -> Loaded {
         Some(dir) => history::sync(&dir, &dedup.cube),
         None => dedup.cube,
     };
-    Loaded { cube, stats: scan.stats, duplicates_skipped: dedup.duplicates_skipped }
+    Loaded {
+        cube,
+        records: scan.records,
+        stats: scan.stats,
+        duplicates_skipped: dedup.duplicates_skipped,
+    }
 }
 
 fn main() {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Dump { json }) => dump(&load(), json),
+        Some(Command::Wrapped { blur }) => {
+            let loaded = load();
+            if let Err(e) = agentop::ui::run_wrapped(loaded.cube, loaded.records, blur) {
+                eprintln!("terminal error: {e}");
+                std::process::exit(1);
+            }
+        }
         None => {
             // Live dashboard: watcher/parser thread -> mpsc -> UI thread.
             let Some(source) = ClaudeCodeSource::new() else {

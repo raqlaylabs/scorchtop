@@ -20,6 +20,7 @@ use crate::view::{
     fmt_cost, fmt_tokens, live_stats, recent_project_totals, view, LiveStats, Period, ViewModel,
 };
 use crate::watch::Snapshot;
+use crate::wrapped::{self, Month, WrappedModel};
 
 // ---------------------------------------------------------------------------
 // Palette: agentop paints its own dark theme (truecolor), btop-style, instead
@@ -867,6 +868,335 @@ fn stacked_bar(
         spans.push(Span::raw(" ".repeat(width - used)));
     }
     spans
+}
+
+// ---------------------------------------------------------------------------
+// `agentop wrapped` — static monthly summary screen. No watcher, no
+// animation: draw, block on input, redraw on month/blur changes.
+
+pub fn run_wrapped(
+    cube: crate::aggregate::Cube,
+    records: Vec<crate::source::UsageRecord>,
+    blur: bool,
+) -> std::io::Result<()> {
+    let (refs, _) = crate::aggregate::dedup(&records);
+    let current = Month::current();
+    let earliest = wrapped::month_bounds(&cube).map_or(current, |(lo, _)| lo.min(current));
+
+    let mut month = current;
+    let mut blur = blur;
+    let mut model = wrapped::wrapped(&cube, &refs, month);
+    let mut terminal = ratatui::init();
+
+    let result = loop {
+        if let Err(e) = terminal.draw(|frame| draw_wrapped(frame, &model, blur)) {
+            break Err(e);
+        }
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break Ok(())
+                }
+                KeyCode::Left | KeyCode::Char('h') if month > earliest => {
+                    month = month.prev();
+                    model = wrapped::wrapped(&cube, &refs, month);
+                }
+                KeyCode::Right | KeyCode::Char('l') if month < current => {
+                    month = month.next();
+                    model = wrapped::wrapped(&cube, &refs, month);
+                }
+                KeyCode::Char('b') => blur = !blur,
+                _ => {}
+            },
+            Ok(_) => {} // resize etc: fall through to redraw
+            Err(e) => break Err(e),
+        }
+    };
+    ratatui::restore();
+    result
+}
+
+fn draw_wrapped(frame: &mut Frame, model: &WrappedModel, blur: bool) {
+    let area = frame.area();
+    frame.buffer_mut().set_style(area, Style::new().bg(BG).fg(FG));
+
+    let [header, main, footer] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(10),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    draw_wrapped_header(frame, header, model, blur);
+    if main.width >= 68 {
+        let [left, right] =
+            Layout::horizontal([Constraint::Length(30), Constraint::Min(34)]).areas(main);
+        let [heat, highlights] =
+            Layout::vertical([Constraint::Length(11), Constraint::Min(4)]).areas(left);
+        draw_wrapped_heatmap(frame, heat, model);
+        draw_wrapped_highlights(frame, highlights, model, blur);
+        draw_wrapped_projects(frame, right, model, blur);
+    } else {
+        let [heat, projects] =
+            Layout::vertical([Constraint::Length(11), Constraint::Min(4)]).areas(main);
+        draw_wrapped_heatmap(frame, heat, model);
+        draw_wrapped_projects(frame, projects, model, blur);
+    }
+    draw_wrapped_footer(frame, footer);
+}
+
+fn draw_wrapped_header(frame: &mut Frame, area: Rect, model: &WrappedModel, blur: bool) {
+    let mut title_spans = vec![
+        Span::styled(" agentop ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled("wrapped ", Style::new().fg(FG).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("v{} ", env!("CARGO_PKG_VERSION")), Style::new().fg(DIM)),
+    ];
+    if blur {
+        title_spans.push(Span::styled("· projects blurred ", Style::new().fg(BADGE)));
+    }
+    let badge = Line::from(vec![
+        Span::styled("[ ◂ ", Style::new().fg(DIM)),
+        Span::styled(&model.label, Style::new().fg(BADGE).add_modifier(Modifier::BOLD)),
+        Span::styled(" ▸ ] ", Style::new().fg(DIM)),
+    ])
+    .right_aligned();
+
+    let t = &model.totals;
+    let cost = if t.has_unknown_model && t.known_cost == 0.0 && t.records > 0 {
+        None
+    } else {
+        Some(t.known_cost)
+    };
+    let stats = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(fmt_cost(cost), Style::new().fg(MONEY).add_modifier(Modifier::BOLD)),
+        Span::styled(" est. API value", Style::new().fg(DIM)),
+        Span::styled(
+            format!(" · {} tok", fmt_tokens(t.tokens.total())),
+            Style::new().fg(ACCENT),
+        ),
+        Span::styled(
+            format!(
+                " · {} active days · {} sessions",
+                model.active_days, model.session_count
+            ),
+            Style::new().fg(DIM),
+        ),
+    ]);
+
+    let block = Block::new().borders(Borders::BOTTOM).border_style(Style::new().fg(BORDER));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [row1, row2] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(Line::from(title_spans)), row1);
+    frame.render_widget(Paragraph::new(badge), row1);
+    frame.render_widget(Paragraph::new(stats), row2);
+}
+
+/// Heat scale: cold empty slot, then the equalizer's teal->cyan->white ramp.
+fn heat_color(level: u8) -> Color {
+    if level == 0 {
+        Color::Rgb(23, 30, 42)
+    } else {
+        eq_color(level as f64 / 4.0)
+    }
+}
+
+fn draw_wrapped_heatmap(frame: &mut Frame, area: Rect, model: &WrappedModel) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(BORDER))
+        .title(Line::from(Span::styled(
+            " daily activity ",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 8 || inner.width < 22 {
+        return;
+    }
+
+    let mut grid: HashMap<(u16, u16), u8> = HashMap::new();
+    for cell in &model.heatmap {
+        grid.insert((cell.col, cell.row), cell.level);
+    }
+    let weeks = model.heatmap.iter().map(|c| c.col).max().unwrap_or(0) + 1;
+
+    // Weekday rows Mon..Sun, sparse labels like GitHub's.
+    let mut lines: Vec<Line> = Vec::new();
+    for row in 0..7u16 {
+        let label = match row {
+            0 => "mon ",
+            2 => "wed ",
+            4 => "fri ",
+            6 => "sun ",
+            _ => "    ",
+        };
+        let mut spans = vec![Span::styled(label, Style::new().fg(DIM))];
+        for col in 0..weeks {
+            match grid.get(&(col, row)) {
+                Some(level) => {
+                    spans.push(Span::styled("██", Style::new().fg(heat_color(*level))));
+                    spans.push(Span::raw(" "));
+                }
+                None => spans.push(Span::raw("   ")), // outside the month
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::default());
+    let mut legend = vec![Span::styled("less ", Style::new().fg(DIM))];
+    for level in 0..=4u8 {
+        legend.push(Span::styled("██", Style::new().fg(heat_color(level))));
+        legend.push(Span::raw(" "));
+    }
+    legend.push(Span::styled("more", Style::new().fg(DIM)));
+    lines.push(Line::from(legend));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_wrapped_highlights(frame: &mut Frame, area: Rect, model: &WrappedModel, blur: bool) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(BORDER))
+        .title(Line::from(Span::styled(
+            " highlights ",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled("biggest session", Style::new().fg(DIM))));
+    match &model.biggest_session {
+        Some(s) => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}", s.display(blur)),
+                    Style::new().fg(FG).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" · {}", s.date.format("%b %-d")), Style::new().fg(DIM)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} tok", fmt_tokens(s.tokens)), Style::new().fg(ACCENT)),
+                Span::styled(format!(" · {}", fmt_cost(s.est_cost)), Style::new().fg(MONEY)),
+            ]));
+        }
+        None => lines.push(Line::from(Span::styled(
+            "  no transcripts this month",
+            Style::new().fg(DIM),
+        ))),
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("busiest day", Style::new().fg(DIM))));
+    match model.busiest_day {
+        Some((date, tokens)) => lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}", date.format("%b %-d")),
+                Style::new().fg(FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" · {} tok", fmt_tokens(tokens)), Style::new().fg(ACCENT)),
+        ])),
+        None => {
+            lines.push(Line::from(Span::styled("  no usage this month", Style::new().fg(DIM))))
+        }
+    }
+    lines.truncate(inner.height as usize);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_wrapped_projects(frame: &mut Frame, area: Rect, model: &WrappedModel, blur: bool) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(BORDER))
+        .title(Line::from(vec![
+            Span::styled(" top projects ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled("· most expensive first ", Style::new().fg(DIM)),
+        ]))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if model.projects.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("no usage this month", Style::new().fg(DIM)))),
+            inner,
+        );
+        return;
+    }
+
+    let name_w = model
+        .projects
+        .iter()
+        .map(|p| p.display(blur).chars().count())
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 18);
+    let tokens_w = 8usize;
+    let cost_w = 9usize;
+    let bar_w = (inner.width as usize).saturating_sub(3 + name_w + 2 + tokens_w + cost_w + 4);
+
+    let visible = inner.height as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, p) in model.projects.iter().enumerate() {
+        if lines.len() + 1 == visible && model.projects.len() > visible {
+            lines.push(Line::from(Span::styled(
+                format!("… {} more", model.projects.len() - i),
+                Style::new().fg(DIM),
+            )));
+            break;
+        }
+        let full = p.display(blur);
+        let name: String = if full.chars().count() > name_w {
+            let truncated: String = full.chars().take(name_w - 1).collect();
+            format!("{truncated}…")
+        } else {
+            full.to_string()
+        };
+        let mut spans = vec![
+            Span::styled(format!("{:>2} ", i + 1), Style::new().fg(DIM)),
+            Span::styled(
+                format!("{name:<name_w$}"),
+                Style::new().fg(FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+        ];
+        spans.extend(gradient_bar(p.frac, bar_w, i));
+        spans.extend([
+            Span::raw("  "),
+            Span::styled(format!("{:>tokens_w$}", fmt_tokens(p.tokens)), Style::new().fg(ACCENT)),
+            Span::raw("  "),
+            Span::styled(format!("{:>cost_w$}", fmt_cost(p.est_cost)), Style::new().fg(MONEY)),
+        ]);
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_wrapped_footer(frame: &mut Frame, area: Rect) {
+    let mut spans = Vec::new();
+    for (key, label) in [("◂ ▸", "month"), ("b", "blur names"), ("q", "quit")] {
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::new().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {label}   "), Style::new().fg(DIM)));
+    }
+    let hints = Line::from(spans);
+    let note = Line::from(Span::styled(
+        "$ = est. API value, not your subscription price ",
+        Style::new().fg(DIM),
+    ))
+    .right_aligned();
+    let fits = (area.width as usize) > hints.width() + note.width();
+    frame.render_widget(Paragraph::new(hints), area);
+    if fits {
+        frame.render_widget(Paragraph::new(note), area);
+    }
 }
 
 /// Horizontal unicode-block bar with 1/8-cell resolution and a per-cell

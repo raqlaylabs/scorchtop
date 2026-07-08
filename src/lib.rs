@@ -6,3 +6,4 @@ pub mod source;
 pub mod ui;
 pub mod view;
 pub mod watch;
+pub mod wrapped;
