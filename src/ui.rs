@@ -751,7 +751,8 @@ fn draw_turns(frame: &mut Frame, area: Rect, app: &App) {
     let lines: Vec<Line> = turns
         .iter()
         .take(inner.height as usize)
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let dot = if t.active {
                 Span::styled("● ", Style::new().fg(if blink_on() { LIVE } else { LIVE_DIM }))
             } else {
@@ -762,8 +763,13 @@ fn draw_turns(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 format!("{:<9}", t.project)
             };
+            // Runs of the same project read as one group: only the first row
+            // of a run gets a bright name, so project changes pop.
+            let repeated = i > 0 && turns[i - 1].project == t.project;
             let name_style = if t.active {
                 Style::new().fg(LIVE).add_modifier(Modifier::BOLD)
+            } else if repeated {
+                Style::new().fg(DIM)
             } else {
                 Style::new().fg(FG).add_modifier(Modifier::BOLD)
             };
