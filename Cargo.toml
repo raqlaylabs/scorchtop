@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "btop for AI coding agents — live Claude Code token usage dashboard"
 license = "MIT"
+repository = "https://github.com/raqlaylabs/scorchtop"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -17,3 +18,8 @@ notify = "8"
 # GIF export of the wrapped entrance animation (user-approved additions).
 gif = "0.13"
 fontdue = "0.9"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

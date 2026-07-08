@@ -1,0 +1,15 @@
+{
+  "name": "scorchtop",
+  "version": "0.1.0",
+  "description": "btop for AI coding agents — live Claude Code token usage dashboard",
+  "keywords": ["claude", "claude-code", "tui", "tokens", "usage", "dashboard"],
+  "repository": "github:raqlaylabs/scorchtop",
+  "license": "MIT",
+  "bin": { "scorchtop": "bin/scorchtop.js" },
+  "engines": { "node": ">=18" },
+  "optionalDependencies": {
+    "scorchtop-darwin-arm64": "0.1.0",
+    "scorchtop-darwin-x64": "0.1.0",
+    "scorchtop-linux-x64": "0.1.0"
+  }
+}
