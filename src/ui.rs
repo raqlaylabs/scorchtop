@@ -26,8 +26,10 @@ use crate::wrapped::{self, Month, WrappedModel};
 // Palette: agentop paints its own dark theme (truecolor), btop-style, instead
 // of inheriting the terminal's colors.
 
-const BG: Color = Color::Rgb(9, 12, 18);
-const FG: Color = Color::Rgb(196, 205, 216);
+const BG_RGB: (u8, u8, u8) = (9, 12, 18);
+const FG_RGB: (u8, u8, u8) = (196, 205, 216);
+const BG: Color = Color::Rgb(BG_RGB.0, BG_RGB.1, BG_RGB.2);
+const FG: Color = Color::Rgb(FG_RGB.0, FG_RGB.1, FG_RGB.2);
 const DIM: Color = Color::Rgb(100, 110, 126);
 const BORDER: Color = Color::Rgb(42, 52, 68);
 const ACCENT: Color = Color::Rgb(56, 214, 240);
@@ -878,9 +880,11 @@ fn stacked_bar(
 
 /// Entrance animation length.
 const WRAP_ANIM: Duration = Duration::from_millis(800);
-/// In-app `.cast` recording: offline render rate and settle hold.
-const CAST_FPS: f64 = 30.0;
-const CAST_HOLD_SECS: f64 = 1.5;
+/// In-app GIF recording: offline render rate, settle hold, and output
+/// resolution (font pixel size; one cell ≈ 0.6×/1.2× of it).
+const GIF_FPS: f64 = 30.0;
+const GIF_HOLD_CS: u16 = 200;
+const GIF_FONT_PX: f32 = 28.0;
 
 fn ease_out(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
@@ -942,14 +946,14 @@ pub fn run_wrapped(
                         KeyCode::Char('b') => blur = !blur,
                         KeyCode::Char('r') => {
                             let name = format!(
-                                "agentop-wrapped-{}.cast",
+                                "agentop-wrapped-{}.gif",
                                 model.label.to_lowercase().replace(' ', "-")
                             );
                             notice = Some(match terminal
                                 .size()
-                                .and_then(|s| record_wrapped_cast(&model, blur, s, name.as_ref()))
+                                .and_then(|s| record_wrapped_gif(&model, blur, s, name.as_ref()))
                             {
-                                Ok(()) => format!("● saved ./{name} — gif: agg {name} out.gif"),
+                                Ok(()) => format!("● saved ./{name}"),
                                 Err(e) => format!("record failed: {e}"),
                             });
                             opened = Instant::now(); // mirror the recording on screen
@@ -968,10 +972,10 @@ pub fn run_wrapped(
 }
 
 /// Render the entrance animation for the current view into an off-screen
-/// buffer at a fixed frame rate and write it as an asciinema cast in the
-/// working directory. No screen capture involved, so the result is always
-/// smooth regardless of terminal or load.
-fn record_wrapped_cast(
+/// buffer at a fixed frame rate and encode it straight to an animated GIF
+/// in the working directory. No screen capture or external tools involved,
+/// so the result is always smooth regardless of terminal or load.
+fn record_wrapped_gif(
     model: &WrappedModel,
     blur: bool,
     size: ratatui::layout::Size,
@@ -979,17 +983,19 @@ fn record_wrapped_cast(
 ) -> std::io::Result<()> {
     let backend = ratatui::backend::TestBackend::new(size.width, size.height);
     let mut term = ratatui::Terminal::new(backend)?;
-    let steps = (WRAP_ANIM.as_secs_f64() * CAST_FPS).ceil() as usize;
-    let mut frames: Vec<(f64, String)> = Vec::with_capacity(steps + 2);
+    let steps = (WRAP_ANIM.as_secs_f64() * GIF_FPS).ceil() as usize;
+    let delay_cs = (100.0 / GIF_FPS).round() as u16;
+    let mut frames: Vec<(u16, ratatui::buffer::Buffer)> = Vec::with_capacity(steps + 2);
     for i in 0..=steps {
         let t = i as f64 / steps as f64;
         term.draw(|frame| draw_wrapped(frame, model, blur, t, None))?;
-        frames.push((i as f64 / CAST_FPS, crate::cast::frame_to_ansi(term.backend().buffer())));
+        frames.push((delay_cs, term.backend().buffer().clone()));
     }
     // Hold the settled scorecard so the loop doesn't cut straight to black.
-    let settled = frames.last().expect("at least one frame").1.clone();
-    frames.push((WRAP_ANIM.as_secs_f64() + CAST_HOLD_SECS, settled));
-    crate::cast::write_cast(path, size.width, size.height, &frames)
+    if let Some(last) = frames.last_mut() {
+        last.0 = GIF_HOLD_CS;
+    }
+    crate::render::write_gif(path, GIF_FONT_PX, &frames, FG_RGB, BG_RGB)
 }
 
 fn draw_wrapped(
@@ -1301,7 +1307,7 @@ fn draw_wrapped_footer(frame: &mut Frame, area: Rect, notice: Option<&str>) {
     }
     let mut spans = Vec::new();
     for (key, label) in
-        [("◂ ▸", "month"), ("b", "blur names"), ("r", "record .cast"), ("q", "quit")]
+        [("◂ ▸", "month"), ("b", "blur names"), ("r", "record gif"), ("q", "quit")]
     {
         spans.push(Span::styled(
             format!(" {key} "),

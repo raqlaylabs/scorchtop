@@ -3,6 +3,7 @@ pub mod cast;
 pub mod history;
 pub mod lines;
 pub mod pricing;
+pub mod render;
 pub mod source;
 pub mod ui;
 pub mod view;
