@@ -42,6 +42,12 @@ pub struct UsageRecord {
     pub message_id: Option<String>,
     pub request_id: Option<String>,
     pub usage: TokenUsage,
+    /// Tailer-assigned turn id linking this record to a `TurnMeta`. `None`
+    /// for records outside live turn tracking (full scans, history).
+    pub turn: Option<u32>,
+    /// Lines written by this message's Write/Edit tool calls. Carried on the
+    /// record so streaming duplicates dedup lines exactly like tokens.
+    pub lines_written: u64,
 }
 
 #[derive(Debug, Default, Clone)]

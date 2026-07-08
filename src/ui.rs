@@ -32,6 +32,17 @@ const BORDER: Color = Color::Rgb(42, 52, 68);
 const ACCENT: Color = Color::Rgb(56, 214, 240);
 const MONEY: Color = Color::Rgb(74, 222, 128);
 const LIVE: Color = Color::Rgb(94, 250, 154);
+/// Off-phase of a blinking live dot.
+const LIVE_DIM: Color = Color::Rgb(32, 96, 60);
+
+/// Blink phase for live dots: 600ms on/off on the wall clock, so no tick
+/// state is needed — live sessions keep the animation loop redrawing anyway.
+fn blink_on() -> bool {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() / 600 % 2 == 0)
+        .unwrap_or(true)
+}
 const BADGE: Color = Color::Rgb(250, 204, 21);
 const PEAK: Color = Color::Rgb(226, 232, 240);
 
@@ -134,6 +145,8 @@ struct App {
     scale: f64,
     /// Color project bars by model share instead of the rank gradient.
     split_by_model: bool,
+    /// Show recent turns instead of models in the right-side panel.
+    show_turns: bool,
 }
 
 impl App {
@@ -149,6 +162,7 @@ impl App {
             primed: false,
             scale: SCALE_FLOOR,
             split_by_model: false,
+            show_turns: false,
         }
     }
 
@@ -276,6 +290,10 @@ pub fn run(rx: Receiver<Snapshot>) -> std::io::Result<()> {
                             app.split_by_model = !app.split_by_model;
                             dirty = true;
                         }
+                        KeyCode::Char('t') => {
+                            app.show_turns = !app.show_turns;
+                            dirty = true;
+                        }
                         _ => {}
                     }
                 } else {
@@ -318,7 +336,11 @@ fn draw(frame: &mut Frame, app: &App) {
         let [left, right] =
             Layout::horizontal([Constraint::Min(60), Constraint::Length(46)]).areas(main);
         draw_projects(frame, left, app, false);
-        draw_models(frame, right, app);
+        if app.show_turns {
+            draw_turns(frame, right, app);
+        } else {
+            draw_models(frame, right, app);
+        }
     } else {
         // Tell the user the models panel exists — it needs more columns.
         let widen_hint = !app.vm.models.is_empty();
@@ -338,8 +360,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     if scanning {
         title_spans.push(Span::styled("· scanning ~/.claude …", Style::new().fg(DIM)));
     } else if app.live.is_active {
+        let dot = Style::new().fg(if blink_on() { LIVE } else { LIVE_DIM });
+        title_spans.push(Span::styled("● ", dot.add_modifier(Modifier::BOLD)));
         title_spans
-            .push(Span::styled("● live ", Style::new().fg(LIVE).add_modifier(Modifier::BOLD)));
+            .push(Span::styled("live ", Style::new().fg(LIVE).add_modifier(Modifier::BOLD)));
         title_spans
             .push(Span::styled(app.live.active_projects.join(", "), Style::new().fg(LIVE)));
     } else {
@@ -700,11 +724,78 @@ fn draw_models(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_turns(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(BORDER))
+        .title(Line::from(vec![
+            Span::styled(" turns ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled("· prompt → tok → lines ", Style::new().fg(DIM)),
+        ]))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let turns = app.snapshot.as_ref().map(|s| s.turns.as_slice()).unwrap_or_default();
+    if turns.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no prompts seen yet",
+                Style::new().fg(DIM),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    let lines: Vec<Line> = turns
+        .iter()
+        .take(inner.height as usize)
+        .map(|t| {
+            let dot = if t.active {
+                Span::styled("● ", Style::new().fg(if blink_on() { LIVE } else { LIVE_DIM }))
+            } else {
+                Span::raw("  ")
+            };
+            let name: String = if t.project.chars().count() > 9 {
+                format!("{}…", t.project.chars().take(8).collect::<String>())
+            } else {
+                format!("{:<9}", t.project)
+            };
+            let name_style = if t.active {
+                Style::new().fg(LIVE).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(FG).add_modifier(Modifier::BOLD)
+            };
+            Line::from(vec![
+                dot,
+                Span::styled(name, name_style),
+                Span::styled(
+                    format!("{:>7}", format!("{}ch", fmt_tokens(t.prompt_chars))),
+                    Style::new().fg(DIM),
+                ),
+                Span::styled(format!("{:>8}", fmt_tokens(t.tokens)), Style::new().fg(ACCENT)),
+                Span::styled(
+                    format!("{:>7}", format!("{}ln", fmt_tokens(t.lines_written))),
+                    Style::new().fg(PEAK),
+                ),
+                Span::styled(format!("{:>9}", fmt_cost(t.est_cost)), Style::new().fg(MONEY)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect) {
     let mut spans = Vec::new();
-    for (key, label) in
-        [("d", "today"), ("w", "7 days"), ("m", "30 days"), ("x", "models"), ("q", "quit")]
-    {
+    for (key, label) in [
+        ("d", "today"),
+        ("w", "7 days"),
+        ("m", "30 days"),
+        ("x", "models"),
+        ("t", "turns"),
+        ("q", "quit"),
+    ] {
         spans.push(Span::styled(
             format!(" {key} "),
             Style::new().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD),

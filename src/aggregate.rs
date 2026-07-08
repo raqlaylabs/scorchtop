@@ -184,6 +184,8 @@ mod tests {
             message_id: mid.map(String::from),
             request_id: rid.map(String::from),
             usage: TokenUsage { input, output: 10, cache_create: 0, cache_read: 0 },
+            turn: None,
+            lines_written: 0,
         }
     }
 

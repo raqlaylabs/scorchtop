@@ -192,6 +192,80 @@ pub fn live_stats(
     stats
 }
 
+/// One prompt→reply turn for the turns panel: what a typed prompt cost.
+/// `lines_written` is Write/Edit output, deliberately not "surviving code".
+#[derive(Debug, Clone)]
+pub struct TurnRow {
+    /// Project display name.
+    pub project: String,
+    pub prompt_chars: u64,
+    /// Total tokens of this turn's deduped records (subagent transcripts in
+    /// separate files are not attributable, so this is a floor).
+    pub tokens: u64,
+    pub est_cost: Option<f64>,
+    pub lines_written: u64,
+    pub started: chrono::DateTime<chrono::Utc>,
+    /// Still streaming: unfinished with non-stale writes (crash-guarded).
+    pub active: bool,
+}
+
+/// Newest turns shown in the panel.
+pub const TURN_ROW_LIMIT: usize = 15;
+
+/// Join per-file turn metadata with deduplicated records (matched on
+/// `UsageRecord::turn`) into display rows, newest first. Each meta arrives as
+/// (project display name, that file's last write time, meta).
+pub fn turn_rows(
+    turns: &[(String, chrono::DateTime<chrono::Utc>, crate::watch::TurnMeta)],
+    records: &[&crate::source::UsageRecord],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<TurnRow> {
+    #[derive(Default)]
+    struct Acc {
+        tokens: u64,
+        known_cost: f64,
+        has_unknown_model: bool,
+        lines_written: u64,
+    }
+    let mut by_turn: std::collections::HashMap<u32, Acc> = Default::default();
+    for r in records {
+        let Some(id) = r.turn else { continue };
+        let acc = by_turn.entry(id).or_default();
+        acc.tokens += r.usage.total();
+        acc.lines_written += r.lines_written;
+        match crate::pricing::pricing_for(&r.model) {
+            Some(p) => acc.known_cost += p.cost(&r.usage),
+            None => acc.has_unknown_model = true,
+        }
+    }
+
+    let stale_cutoff = now - chrono::Duration::seconds(STALE_WORK_SECS);
+    let mut rows: Vec<(u32, TurnRow)> = turns
+        .iter()
+        .map(|(project, last_write, meta)| {
+            let acc = by_turn.remove(&meta.id).unwrap_or_default();
+            (meta.id, TurnRow {
+                project: project.clone(),
+                prompt_chars: meta.prompt_chars,
+                tokens: acc.tokens,
+                est_cost: if acc.has_unknown_model && acc.known_cost == 0.0 {
+                    None
+                } else {
+                    Some(acc.known_cost)
+                },
+                lines_written: acc.lines_written,
+                started: meta.started,
+                active: meta.ended.is_none() && *last_write >= stale_cutoff,
+            })
+        })
+        .collect();
+    // Timestamps are second-resolution, so same-second prompts tie; within a
+    // file the turn id is chronological and breaks the tie.
+    rows.sort_by_key(|(id, r)| std::cmp::Reverse((r.started, *id)));
+    rows.truncate(TURN_ROW_LIMIT);
+    rows.into_iter().map(|(_, r)| r).collect()
+}
+
 /// Total tokens per project (display name) over the recent window. The UI
 /// diffs consecutive results to feed the equalizer's animation energy.
 pub fn recent_project_totals(
@@ -329,6 +403,8 @@ mod tests {
             message_id: None,
             request_id: None,
             usage: TokenUsage { input: total, output: 0, cache_create: 0, cache_read: 0 },
+            turn: None,
+            lines_written: 0,
         };
 
         let act = |name: &str, working: bool, secs_ago: i64| crate::watch::ProjectActivity {
@@ -360,6 +436,68 @@ mod tests {
         let totals = recent_project_totals(&records);
         assert_eq!(totals.len(), 1);
         assert_eq!(totals["alpha"], 1699);
+    }
+
+    #[test]
+    fn turn_rows_join_group_and_guard() {
+        use crate::source::UsageRecord;
+        use crate::watch::TurnMeta;
+        use chrono::{TimeZone, Utc};
+
+        let now = Utc.with_ymd_and_hms(2026, 7, 6, 12, 0, 0).unwrap();
+        let rec = |turn: u32, total: u64, model: &str| UsageRecord {
+            project_key: "-u-alpha".into(),
+            cwd: Some("/u/alpha".into()),
+            session_id: Some("s".into()),
+            timestamp: now,
+            model: model.into(),
+            message_id: None,
+            request_id: None,
+            usage: TokenUsage { input: total, output: 0, cache_create: 0, cache_read: 0 },
+            turn: Some(turn),
+            lines_written: 3,
+        };
+        let meta = |id: u32, mins_ago: i64, ended: bool| TurnMeta {
+            id,
+            prompt_chars: 10 * id as u64,
+            started: now - chrono::Duration::minutes(mins_ago),
+            ended: ended.then_some(now),
+        };
+
+        let records = [
+            rec(1, 100, "claude-opus-4-8"),
+            rec(1, 50, "claude-opus-4-8"),
+            rec(2, 999, "mystery-model"),
+        ];
+        let refs: Vec<&UsageRecord> = records.iter().collect();
+        let turns = vec![
+            ("alpha".to_string(), now, meta(1, 30, true)),
+            // Open turn with fresh writes: active.
+            ("alpha".to_string(), now, meta(2, 5, false)),
+            // Open turn whose file went silent 20 min ago: crash-guarded.
+            ("beta".to_string(), now - chrono::Duration::minutes(20), meta(3, 15, false)),
+        ];
+        let rows = turn_rows(&turns, &refs, now);
+
+        assert_eq!(rows.len(), 3, "newest first");
+        assert_eq!(rows[0].prompt_chars, 20);
+        assert!(rows[0].active);
+        assert_eq!(rows[0].est_cost, None, "unpriced model shows — not a guess");
+        assert_eq!(rows[0].tokens, 999);
+
+        assert!(!rows[1].active, "stale mid-turn file must not read as live");
+        assert_eq!(rows[1].tokens, 0);
+
+        let done = &rows[2];
+        assert_eq!(done.tokens, 150, "records grouped by turn id");
+        assert_eq!(done.lines_written, 6);
+        assert!(!done.active);
+        assert!(done.est_cost.unwrap() > 0.0);
+
+        // Rows are capped at the display limit.
+        let many: Vec<_> =
+            (10..40).map(|i| ("alpha".to_string(), now, meta(i, i as i64, true))).collect();
+        assert_eq!(turn_rows(&many, &[], now).len(), TURN_ROW_LIMIT);
     }
 
     #[test]

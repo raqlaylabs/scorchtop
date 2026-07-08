@@ -25,8 +25,9 @@ use notify::{RecursiveMode, Watcher};
 use crate::aggregate::{cube_from, dedup, Cube};
 use crate::history;
 use crate::lines::LineBuffer;
-use crate::source::claude_code::{display_name_from_key, parse_line, LineOutcome, TurnSignal};
+use crate::source::claude_code::{display_name_from_key, parse_line, LineMeta, LineOutcome, TurnSignal};
 use crate::source::{ScanStats, UsageRecord};
+use crate::view::TurnRow;
 
 /// Per-project turn state. `working` follows the transcript's own protocol —
 /// a user line (prompt or tool result) starts a turn, an assistant
@@ -50,9 +51,26 @@ pub struct Snapshot {
     pub recent: Vec<UsageRecord>,
     /// Per-project last write time, for the live/idle indicators.
     pub activity: Vec<ProjectActivity>,
+    /// Recent prompt→reply turns, newest first, for the turns panel.
+    pub turns: Vec<TurnRow>,
     pub stats: ScanStats,
     pub duplicates_skipped: u64,
 }
+
+/// One typed-prompt→end_turn span in a session file. Records that arrive
+/// while the turn is open carry its `id`, so per-turn tokens survive dedup.
+#[derive(Debug, Clone)]
+pub struct TurnMeta {
+    /// Tailer-wide unique id (never reused across files).
+    pub id: u32,
+    pub prompt_chars: u64,
+    pub started: DateTime<Utc>,
+    /// `None` while the turn is still streaming.
+    pub ended: Option<DateTime<Utc>>,
+}
+
+/// Turns kept per session file; older ones fall off (the panel shows fewer).
+const MAX_TURNS_PER_FILE: usize = 12;
 
 struct TailState {
     project_key: String,
@@ -65,6 +83,48 @@ struct TailState {
     /// This file's own mtime — the crash guard must be per session, or one
     /// stale mid-turn file keeps its whole project "live" forever.
     last_write: DateTime<Utc>,
+    /// Id of the turn currently open in this file, if any.
+    current_turn: Option<u32>,
+    /// Recent turns of this file, oldest first.
+    turns: Vec<TurnMeta>,
+}
+
+impl TailState {
+    /// Fold one parsed line's turn information into this file's turn list.
+    /// `next_turn` is the tailer-wide id counter.
+    fn apply(&mut self, meta: &LineMeta, next_turn: &mut u32, now: DateTime<Utc>) {
+        let ts = meta.timestamp.unwrap_or(now);
+        if let Some(chars) = meta.prompt_chars {
+            // A new prompt while a turn is still open (e.g. an interrupt that
+            // never hit the transcript) closes the old turn.
+            if let Some(open) = self.open_turn() {
+                open.ended = Some(ts);
+            }
+            *next_turn += 1;
+            self.current_turn = Some(*next_turn);
+            self.turns.push(TurnMeta { id: *next_turn, prompt_chars: chars, started: ts, ended: None });
+            if self.turns.len() > MAX_TURNS_PER_FILE {
+                let excess = self.turns.len() - MAX_TURNS_PER_FILE;
+                self.turns.drain(..excess);
+            }
+        }
+        match meta.signal {
+            TurnSignal::Working => self.working = true,
+            TurnSignal::TurnEnded => {
+                self.working = false;
+                if let Some(open) = self.open_turn() {
+                    open.ended = Some(ts);
+                }
+                self.current_turn = None;
+            }
+            TurnSignal::Neutral => {}
+        }
+    }
+
+    fn open_turn(&mut self) -> Option<&mut TurnMeta> {
+        let id = self.current_turn?;
+        self.turns.iter_mut().find(|t| t.id == id)
+    }
 }
 
 /// Incremental tailer over `<root>/<project>/**/*.jsonl`. Accumulates raw
@@ -79,6 +139,8 @@ pub struct Tailer {
     arrivals: HashMap<String, DateTime<Utc>>,
     /// project key -> display name, learned from parsed records' `cwd`.
     names: HashMap<String, String>,
+    /// Tailer-wide turn id counter; see `TurnMeta::id`.
+    next_turn: u32,
 }
 
 impl Tailer {
@@ -94,6 +156,7 @@ impl Tailer {
             malformed_lines: 0,
             arrivals: HashMap::new(),
             names: HashMap::new(),
+            next_turn: 0,
         }
     }
 
@@ -137,6 +200,8 @@ impl Tailer {
             buf: LineBuffer::new(),
             working: false,
             last_write: DateTime::<Utc>::MIN_UTC,
+            current_turn: None,
+            turns: Vec::new(),
         });
 
         // open -> seek -> read -> close; never keep a handle on Claude Code's files.
@@ -179,15 +244,14 @@ impl Tailer {
         drop(file);
         state.offset += bytes.len() as u64;
 
-        let apply = |working: &mut bool, signal: TurnSignal| match signal {
-            TurnSignal::Working => *working = true,
-            TurnSignal::TurnEnded => *working = false,
-            TurnSignal::Neutral => {}
-        };
+        let now = Utc::now();
         for line in state.buf.push(&bytes) {
             match parse_line(&line, &state.project_key) {
-                LineOutcome::Record(r, signal) => {
-                    apply(&mut state.working, signal);
+                LineOutcome::Record(mut r, meta) => {
+                    // Tag before apply: the end_turn record belongs to the
+                    // turn it closes (records never open turns themselves).
+                    r.turn = state.current_turn;
+                    state.apply(&meta, &mut self.next_turn, now);
                     if let Some(cwd) = &r.cwd {
                         if let Some(name) = cwd.rsplit('/').find(|s| !s.is_empty()) {
                             self.names.insert(state.project_key.clone(), name.to_string());
@@ -195,14 +259,22 @@ impl Tailer {
                     }
                     self.records.push(*r);
                 }
-                LineOutcome::Skipped(signal) => apply(&mut state.working, signal),
+                LineOutcome::Skipped(meta) => state.apply(&meta, &mut self.next_turn, now),
                 LineOutcome::Malformed => self.malformed_lines += 1,
             }
         }
         if probe_tail {
             if let Some(tail) = state.buf.partial_str() {
-                if let LineOutcome::Record(r, signal) = parse_line(&tail, &state.project_key) {
-                    apply(&mut state.working, signal);
+                if let LineOutcome::Record(mut r, meta) = parse_line(&tail, &state.project_key) {
+                    // The torn line stays buffered and is parsed again once
+                    // complete, so only the idempotent working flag is
+                    // applied here — turn/line counting would double.
+                    match meta.signal {
+                        TurnSignal::Working => state.working = true,
+                        TurnSignal::TurnEnded => state.working = false,
+                        TurnSignal::Neutral => {}
+                    }
+                    r.turn = state.current_turn;
                     self.records.push(*r);
                 }
             }
@@ -212,9 +284,10 @@ impl Tailer {
 
     /// Build a snapshot: dedup, merge with history, slice recent records.
     pub fn snapshot(&self, stored_history: &Cube) -> Snapshot {
+        let now = chrono::Utc::now();
         let (survivors, duplicates_skipped) = dedup(&self.records);
         let cube = history::merge(stored_history.clone(), &cube_from(survivors.iter().copied()));
-        let cutoff = chrono::Utc::now() - chrono::Duration::minutes(75);
+        let cutoff = now - chrono::Duration::minutes(75);
         let recent = survivors
             .iter()
             .filter(|r| r.timestamp >= cutoff)
@@ -249,10 +322,23 @@ impl Tailer {
                 }
             })
             .collect();
+        let mut turn_src: Vec<(String, DateTime<Utc>, TurnMeta)> = Vec::new();
+        for state in self.states.values() {
+            let name = self
+                .names
+                .get(&state.project_key)
+                .cloned()
+                .unwrap_or_else(|| display_name_from_key(&state.project_key));
+            for meta in &state.turns {
+                turn_src.push((name.clone(), state.last_write, meta.clone()));
+            }
+        }
+        let turns = crate::view::turn_rows(&turn_src, &survivors, now);
         Snapshot {
             cube,
             recent,
             activity,
+            turns,
             stats: ScanStats {
                 files_scanned: self.files_seen(),
                 malformed_lines: self.malformed_lines,

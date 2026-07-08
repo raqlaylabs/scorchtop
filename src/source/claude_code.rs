@@ -101,10 +101,10 @@ fn scan_bytes(bytes: &[u8], project_key: &str, records: &mut Vec<UsageRecord>, s
 }
 
 pub enum LineOutcome {
-    Record(Box<UsageRecord>, TurnSignal),
+    Record(Box<UsageRecord>, LineMeta),
     /// Valid JSON that isn't an assistant usage record (user turns,
     /// attachments, snapshots, ...). Not an error.
-    Skipped(TurnSignal),
+    Skipped(LineMeta),
     /// Not valid JSON.
     Malformed,
 }
@@ -113,12 +113,25 @@ pub enum LineOutcome {
 /// live indicator: a user line (prompt or tool result) means work is starting
 /// or continuing; an assistant `end_turn` means the reply is finished and the
 /// human is reading/typing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TurnSignal {
     Working,
     TurnEnded,
     /// No turn information (snapshots, system lines, subagent sidechains).
+    #[default]
     Neutral,
+}
+
+/// Everything one line says about the turn it belongs to, beyond usage.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LineMeta {
+    pub signal: TurnSignal,
+    /// `Some(chars)` when this is a human-typed prompt (`promptSource:
+    /// "typed"`) — the start of a turn. Tool results, slash-command
+    /// expansions, and skill injections are user lines too but carry `None`.
+    pub prompt_chars: Option<u64>,
+    /// The line's own timestamp, when it carries a parseable one.
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +147,8 @@ struct RawLine {
     cwd: Option<String>,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
+    #[serde(rename = "promptSource")]
+    prompt_source: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +157,10 @@ struct RawMessage {
     model: Option<String>,
     usage: Option<RawUsage>,
     stop_reason: Option<String>,
+    /// Left as raw JSON: content shapes vary wildly across line types
+    /// (string, block arrays, nested tool payloads) and a typed enum here
+    /// would turn unexpected shapes into malformed-line counts.
+    content: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -160,7 +179,7 @@ struct RawUsage {
 pub fn parse_line(line: &str, project_key: &str) -> LineOutcome {
     let line = line.trim();
     if line.is_empty() {
-        return LineOutcome::Skipped(TurnSignal::Neutral);
+        return LineOutcome::Skipped(LineMeta::default());
     }
     let raw: RawLine = match serde_json::from_str(line) {
         Ok(raw) => raw,
@@ -187,14 +206,35 @@ pub fn parse_line(line: &str, project_key: &str) -> LineOutcome {
             _ => TurnSignal::Neutral,
         }
     };
+    let timestamp = raw
+        .timestamp
+        .as_deref()
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&Utc));
+    let content = raw.message.as_ref().and_then(|m| m.content.as_ref());
+    let meta = LineMeta {
+        signal,
+        prompt_chars: if raw.kind.as_deref() == Some("user")
+            && raw.is_sidechain != Some(true)
+            && raw.prompt_source.as_deref() == Some("typed")
+        {
+            Some(content.map_or(0, prompt_chars_of))
+        } else {
+            None
+        },
+        timestamp,
+    };
     if raw.kind.as_deref() != Some("assistant") {
-        return LineOutcome::Skipped(signal);
+        return LineOutcome::Skipped(meta);
     }
+    // Sidechain (subagent) edits included: they are real work product of the
+    // enclosing turn.
+    let lines_written = content.map_or(0, lines_written_of);
     let Some(message) = raw.message else {
-        return LineOutcome::Skipped(signal);
+        return LineOutcome::Skipped(meta);
     };
     let Some(usage) = message.usage else {
-        return LineOutcome::Skipped(signal);
+        return LineOutcome::Skipped(meta);
     };
     // Zero-usage records (e.g. `<synthetic>` placeholders) carry no signal
     // and would pollute model buckets / the unknown-pricing flag.
@@ -202,34 +242,69 @@ pub fn parse_line(line: &str, project_key: &str) -> LineOutcome {
         + usage.cache_read_input_tokens
         == 0
     {
-        return LineOutcome::Skipped(signal);
+        return LineOutcome::Skipped(meta);
     }
-    let Some(timestamp) = raw
-        .timestamp
-        .as_deref()
-        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| t.with_timezone(&Utc))
-    else {
-        return LineOutcome::Skipped(signal);
+    let Some(timestamp) = timestamp else {
+        return LineOutcome::Skipped(meta);
     };
     LineOutcome::Record(
         Box::new(UsageRecord {
-        project_key: project_key.to_string(),
-        cwd: raw.cwd,
-        session_id: raw.session_id,
-        timestamp,
-        model: message.model.unwrap_or_else(|| "unknown".to_string()),
-        message_id: message.id,
-        request_id: raw.request_id,
-        usage: TokenUsage {
-            input: usage.input_tokens,
-            output: usage.output_tokens,
-            cache_create: usage.cache_creation_input_tokens,
+            project_key: project_key.to_string(),
+            cwd: raw.cwd,
+            session_id: raw.session_id,
+            timestamp,
+            model: message.model.unwrap_or_else(|| "unknown".to_string()),
+            message_id: message.id,
+            request_id: raw.request_id,
+            usage: TokenUsage {
+                input: usage.input_tokens,
+                output: usage.output_tokens,
+                cache_create: usage.cache_creation_input_tokens,
                 cache_read: usage.cache_read_input_tokens,
             },
+            turn: None,
+            lines_written,
         }),
-        signal,
+        meta,
     )
+}
+
+/// Chars of human-typed prompt text: string content, or the text blocks of a
+/// block array (images and other block types contribute nothing).
+fn prompt_chars_of(content: &serde_json::Value) -> u64 {
+    match content {
+        serde_json::Value::String(s) => s.chars().count() as u64,
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .map(|s| s.chars().count() as u64)
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// Lines *written* by an assistant message: newline-delimited lines of
+/// `Write.content` and `Edit.new_string` tool inputs. Deliberately not
+/// "final code" — later turns may rewrite these lines, and survival can't be
+/// measured from transcripts alone.
+fn lines_written_of(content: &serde_json::Value) -> u64 {
+    let serde_json::Value::Array(blocks) = content else {
+        return 0;
+    };
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        .filter_map(|b| {
+            let field = match b.get("name").and_then(|n| n.as_str())? {
+                "Write" => "content",
+                "Edit" => "new_string",
+                _ => return None,
+            };
+            let text = b.get("input")?.get(field)?.as_str()?;
+            Some(text.lines().count() as u64)
+        })
+        .sum()
 }
 
 /// Best-effort decode of the encoded project directory name
@@ -248,9 +323,16 @@ mod tests {
 
     const ASSISTANT_LINE: &str = r#"{"type":"assistant","requestId":"req_1","timestamp":"2026-06-27T17:07:09.521Z","cwd":"/Users/naman/Documents/demo","sessionId":"s1","message":{"id":"msg_1","model":"claude-opus-4-8","role":"assistant","usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":5}}}"#;
 
+    fn skipped_meta(line: &str) -> LineMeta {
+        match parse_line(line, "p") {
+            LineOutcome::Skipped(meta) => meta,
+            _ => panic!("expected skipped line"),
+        }
+    }
+
     #[test]
     fn parses_assistant_record() {
-        let LineOutcome::Record(r, signal) =
+        let LineOutcome::Record(r, meta) =
             parse_line(ASSISTANT_LINE, "-Users-naman-Documents-demo")
         else {
             panic!("expected record");
@@ -259,16 +341,17 @@ mod tests {
         assert_eq!(r.message_id.as_deref(), Some("msg_1"));
         assert_eq!(r.request_id.as_deref(), Some("req_1"));
         assert_eq!(r.usage.total(), 165);
-        assert_eq!(signal, TurnSignal::Working, "no stop_reason => mid-turn");
+        assert_eq!(r.turn, None, "turn ids are assigned by the tailer");
+        assert_eq!(meta.signal, TurnSignal::Working, "no stop_reason => mid-turn");
+        assert!(meta.timestamp.is_some());
     }
 
     #[test]
     fn skips_non_assistant_lines() {
-        assert!(matches!(
-            parse_line(r#"{"type":"user","message":{"role":"user","content":"hi"}}"#, "p"),
-            LineOutcome::Skipped(TurnSignal::Working)
-        ));
-        assert!(matches!(parse_line("", "p"), LineOutcome::Skipped(TurnSignal::Neutral)));
+        let meta =
+            skipped_meta(r#"{"type":"user","message":{"role":"user","content":"hi"}}"#);
+        assert_eq!(meta.signal, TurnSignal::Working);
+        assert_eq!(skipped_meta("").signal, TurnSignal::Neutral);
     }
 
     #[test]
@@ -277,24 +360,67 @@ mod tests {
         let done = ASSISTANT_LINE.replace(r#""role":"assistant""#, r#""stop_reason":"end_turn""#);
         assert!(matches!(
             parse_line(&done, "p"),
-            LineOutcome::Record(_, TurnSignal::TurnEnded)
+            LineOutcome::Record(_, LineMeta { signal: TurnSignal::TurnEnded, .. })
         ));
         // Sidechain (subagent) lines carry no turn signal.
         let side = ASSISTANT_LINE.replace(r#"{"type":"assistant""#, r#"{"isSidechain":true,"type":"assistant""#);
-        assert!(matches!(parse_line(&side, "p"), LineOutcome::Record(_, TurnSignal::Neutral)));
+        assert!(matches!(
+            parse_line(&side, "p"),
+            LineOutcome::Record(_, LineMeta { signal: TurnSignal::Neutral, .. })
+        ));
         // Non-record lines still classify: snapshots are neutral.
-        assert!(matches!(
-            parse_line(r#"{"type":"file-history-snapshot"}"#, "p"),
-            LineOutcome::Skipped(TurnSignal::Neutral)
-        ));
+        assert_eq!(skipped_meta(r#"{"type":"file-history-snapshot"}"#).signal, TurnSignal::Neutral);
         // An interrupted request ends the turn even though it's a user line.
-        assert!(matches!(
-            parse_line(
-                r#"{"type":"user","message":{"content":"[Request interrupted by user]"}}"#,
-                "p"
-            ),
-            LineOutcome::Skipped(TurnSignal::TurnEnded)
-        ));
+        assert_eq!(
+            skipped_meta(r#"{"type":"user","message":{"content":"[Request interrupted by user]"}}"#)
+                .signal,
+            TurnSignal::TurnEnded
+        );
+    }
+
+    #[test]
+    fn typed_prompts_carry_char_counts_and_injected_user_lines_do_not() {
+        // Human-typed prompt: promptSource "typed", string content.
+        let typed = r#"{"type":"user","promptSource":"typed","timestamp":"2026-07-08T10:00:00.000Z","message":{"role":"user","content":"añade tests"}}"#;
+        assert_eq!(skipped_meta(typed).prompt_chars, Some(11), "chars, not bytes");
+
+        // Typed prompt with block content (text + image): text blocks only.
+        let blocks = r#"{"type":"user","promptSource":"typed","message":{"content":[{"type":"text","text":"see this"},{"type":"image","source":{}}]}}"#;
+        assert_eq!(skipped_meta(blocks).prompt_chars, Some(8));
+
+        // Tool results, slash-command expansions, and sidechain prompts are
+        // user lines but not typed prompts.
+        let tool_result = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#;
+        assert_eq!(skipped_meta(tool_result).prompt_chars, None);
+        let command = r#"{"type":"user","message":{"content":"<command-name>/model</command-name>"}}"#;
+        assert_eq!(skipped_meta(command).prompt_chars, None);
+        let side = r#"{"type":"user","isSidechain":true,"promptSource":"typed","message":{"content":"task"}}"#;
+        assert_eq!(skipped_meta(side).prompt_chars, None);
+    }
+
+    #[test]
+    fn counts_lines_written_by_write_and_edit_tools() {
+        let content = r#"[
+            {"type":"text","text":"editing now"},
+            {"type":"tool_use","name":"Write","input":{"file_path":"/a","content":"one\ntwo\nthree\n"}},
+            {"type":"tool_use","name":"Edit","input":{"file_path":"/b","old_string":"x\ny\nz","new_string":"x\nz"}},
+            {"type":"tool_use","name":"Bash","input":{"command":"printf hi"}}
+        ]"#
+        .replace('\n', " ");
+        let line =
+            ASSISTANT_LINE.replace(r#""role":"assistant""#, &format!(r#""content":{content}"#));
+        let LineOutcome::Record(r, _) = parse_line(&line, "p") else {
+            panic!("expected record");
+        };
+        // Write: 3 lines, Edit new_string: 2 lines; Bash and old_string ignored.
+        assert_eq!(r.lines_written, 5);
+
+        // String content (no tool blocks) writes nothing.
+        let plain = ASSISTANT_LINE.replace(r#""role":"assistant""#, r#""content":"just prose""#);
+        let LineOutcome::Record(r, _) = parse_line(&plain, "p") else {
+            panic!("expected record");
+        };
+        assert_eq!(r.lines_written, 0);
     }
 
     #[test]

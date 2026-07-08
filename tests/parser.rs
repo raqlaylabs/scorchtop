@@ -81,3 +81,53 @@ fn scans_real_fixtures_when_present() {
     assert!(agg.totals.tokens.total() > 0);
     assert!(!agg.by_model.is_empty());
 }
+
+#[test]
+fn assembles_turns_from_multi_turn_fixture() {
+    use agentop::watch::Tailer;
+
+    // Copy the fixture tree to a temp root so file mtimes are fresh — the
+    // open turn's `active` flag is crash-guarded on write staleness, and a
+    // checked-out fixture has an arbitrary mtime.
+    let root = std::env::temp_dir().join(format!("agentop-turns-{}", std::process::id()));
+    let project = root.join("-Users-test-gamma");
+    std::fs::create_dir_all(&project).unwrap();
+    // Read + write (not fs::copy, which preserves the old mtime on macOS).
+    let bytes =
+        std::fs::read(fixture_root("turns").join("-Users-test-gamma/session1.jsonl")).unwrap();
+    std::fs::write(project.join("session1.jsonl"), bytes).unwrap();
+
+    let mut tailer = Tailer::new(root.clone());
+    tailer.scan_all(true);
+    let snap = tailer.snapshot(&agentop::aggregate::Cube::new());
+    std::fs::remove_dir_all(&root).ok();
+
+    // Fixture: three typed prompts — one completed turn (with a streaming
+    // duplicate and a Write), one interrupted, one still open at EOF.
+    assert_eq!(snap.turns.len(), 3, "one row per typed prompt");
+    assert_eq!(snap.duplicates_skipped, 1, "streaming duplicate reconciled");
+
+    // Newest first: the open turn ("now add tests").
+    let open = &snap.turns[0];
+    assert_eq!(open.project, "gamma");
+    assert_eq!(open.prompt_chars, "now add tests".chars().count() as u64);
+    assert_eq!(open.tokens, 200 + 20);
+    assert_eq!(open.lines_written, 2, "Edit new_string has 2 lines");
+    assert!(open.active, "no end_turn yet and the file was just written");
+
+    // Interrupted turn: closed, nothing produced.
+    let interrupted = &snap.turns[1];
+    assert_eq!(interrupted.prompt_chars, "quick question".chars().count() as u64);
+    assert_eq!(interrupted.tokens, 0);
+    assert_eq!(interrupted.lines_written, 0);
+    assert!(!interrupted.active);
+
+    // Completed turn: dedup keeps the larger streaming output (150, not 100),
+    // and the end_turn reply's own usage counts toward the turn.
+    let done = &snap.turns[2];
+    assert_eq!(done.prompt_chars, "add a login page".chars().count() as u64);
+    assert_eq!(done.tokens, (1000 + 150) + (500 + 50));
+    assert_eq!(done.lines_written, 4, "the duplicate Write must not double-count lines");
+    assert!(!done.active);
+    assert!(done.est_cost.unwrap() > 0.0);
+}
