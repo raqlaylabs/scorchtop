@@ -871,8 +871,24 @@ fn stacked_bar(
 }
 
 // ---------------------------------------------------------------------------
-// `agentop wrapped` — static monthly summary screen. No watcher, no
-// animation: draw, block on input, redraw on month/blur changes.
+// `agentop wrapped` — monthly summary screen. A short entrance animation
+// (bars sweep in, the heatmap fills chronologically, headline numbers count
+// up) plays on open and on month change, then the screen settles into a
+// static scorecard and blocks on input — no watcher, near-zero idle CPU.
+
+/// Entrance animation length.
+const WRAP_ANIM: Duration = Duration::from_millis(800);
+
+fn ease_out(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Per-bar sweep progress: bars start in rank order, 60ms apart.
+fn sweep(t: f64, rank: usize) -> f64 {
+    let start = rank.min(8) as f64 * 0.06;
+    ease_out((t - start) / 0.55)
+}
 
 pub fn run_wrapped(
     cube: crate::aggregate::Cube,
@@ -887,29 +903,40 @@ pub fn run_wrapped(
     let mut blur = blur;
     let mut model = wrapped::wrapped(&cube, &refs, month);
     let mut terminal = ratatui::init();
+    let mut opened = Instant::now();
 
     let result = loop {
-        if let Err(e) = terminal.draw(|frame| draw_wrapped(frame, &model, blur)) {
+        let t = (opened.elapsed().as_secs_f64() / WRAP_ANIM.as_secs_f64()).min(1.0);
+        if let Err(e) = terminal.draw(|frame| draw_wrapped(frame, &model, blur, t)) {
             break Err(e);
         }
-        match event::read() {
-            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    break Ok(())
-                }
-                KeyCode::Left | KeyCode::Char('h') if month > earliest => {
-                    month = month.prev();
-                    model = wrapped::wrapped(&cube, &refs, month);
-                }
-                KeyCode::Right | KeyCode::Char('l') if month < current => {
-                    month = month.next();
-                    model = wrapped::wrapped(&cube, &refs, month);
-                }
-                KeyCode::Char('b') => blur = !blur,
-                _ => {}
+        // Tick while animating; once settled, block until the next key
+        // (poll's timeout is only a safety net).
+        let timeout = if t < 1.0 { TICK } else { Duration::from_secs(3600) };
+        match event::poll(timeout) {
+            Ok(false) => {} // animation tick
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break Ok(())
+                    }
+                    KeyCode::Left | KeyCode::Char('h') if month > earliest => {
+                        month = month.prev();
+                        model = wrapped::wrapped(&cube, &refs, month);
+                        opened = Instant::now(); // replay the entrance
+                    }
+                    KeyCode::Right | KeyCode::Char('l') if month < current => {
+                        month = month.next();
+                        model = wrapped::wrapped(&cube, &refs, month);
+                        opened = Instant::now();
+                    }
+                    KeyCode::Char('b') => blur = !blur,
+                    _ => {}
+                },
+                Ok(_) => {} // resize etc: fall through to redraw
+                Err(e) => break Err(e),
             },
-            Ok(_) => {} // resize etc: fall through to redraw
             Err(e) => break Err(e),
         }
     };
@@ -917,7 +944,7 @@ pub fn run_wrapped(
     result
 }
 
-fn draw_wrapped(frame: &mut Frame, model: &WrappedModel, blur: bool) {
+fn draw_wrapped(frame: &mut Frame, model: &WrappedModel, blur: bool, t: f64) {
     let area = frame.area();
     frame.buffer_mut().set_style(area, Style::new().bg(BG).fg(FG));
 
@@ -928,25 +955,25 @@ fn draw_wrapped(frame: &mut Frame, model: &WrappedModel, blur: bool) {
     ])
     .areas(area);
 
-    draw_wrapped_header(frame, header, model, blur);
+    draw_wrapped_header(frame, header, model, blur, t);
     if main.width >= 68 {
         let [left, right] =
             Layout::horizontal([Constraint::Length(30), Constraint::Min(34)]).areas(main);
         let [heat, highlights] =
             Layout::vertical([Constraint::Length(11), Constraint::Min(4)]).areas(left);
-        draw_wrapped_heatmap(frame, heat, model);
+        draw_wrapped_heatmap(frame, heat, model, t);
         draw_wrapped_highlights(frame, highlights, model, blur);
-        draw_wrapped_projects(frame, right, model, blur);
+        draw_wrapped_projects(frame, right, model, blur, t);
     } else {
         let [heat, projects] =
             Layout::vertical([Constraint::Length(11), Constraint::Min(4)]).areas(main);
-        draw_wrapped_heatmap(frame, heat, model);
-        draw_wrapped_projects(frame, projects, model, blur);
+        draw_wrapped_heatmap(frame, heat, model, t);
+        draw_wrapped_projects(frame, projects, model, blur, t);
     }
     draw_wrapped_footer(frame, footer);
 }
 
-fn draw_wrapped_header(frame: &mut Frame, area: Rect, model: &WrappedModel, blur: bool) {
+fn draw_wrapped_header(frame: &mut Frame, area: Rect, model: &WrappedModel, blur: bool, t: f64) {
     let mut title_spans = vec![
         Span::styled(" agentop ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled("wrapped ", Style::new().fg(FG).add_modifier(Modifier::BOLD)),
@@ -962,18 +989,23 @@ fn draw_wrapped_header(frame: &mut Frame, area: Rect, model: &WrappedModel, blur
     ])
     .right_aligned();
 
-    let t = &model.totals;
-    let cost = if t.has_unknown_model && t.known_cost == 0.0 && t.records > 0 {
+    let totals = &model.totals;
+    let cost = if totals.has_unknown_model && totals.known_cost == 0.0 && totals.records > 0 {
         None
     } else {
-        Some(t.known_cost)
+        Some(totals.known_cost)
     };
+    // Headline numbers count up with the entrance animation.
+    let e = ease_out(t);
     let stats = Line::from(vec![
         Span::raw(" "),
-        Span::styled(fmt_cost(cost), Style::new().fg(MONEY).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            fmt_cost(cost.map(|c| c * e)),
+            Style::new().fg(MONEY).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" est. API value", Style::new().fg(DIM)),
         Span::styled(
-            format!(" · {} tok", fmt_tokens(t.tokens.total())),
+            format!(" · {} tok", fmt_tokens((totals.tokens.total() as f64 * e) as u64)),
             Style::new().fg(ACCENT),
         ),
         Span::styled(
@@ -1004,7 +1036,7 @@ fn heat_color(level: u8) -> Color {
     }
 }
 
-fn draw_wrapped_heatmap(frame: &mut Frame, area: Rect, model: &WrappedModel) {
+fn draw_wrapped_heatmap(frame: &mut Frame, area: Rect, model: &WrappedModel, t: f64) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(BORDER))
@@ -1019,9 +1051,20 @@ fn draw_wrapped_heatmap(frame: &mut Frame, area: Rect, model: &WrappedModel) {
         return;
     }
 
+    // The map fills in day order during the entrance, like the month being
+    // replayed; the newest revealed day sparkles bright for one tick.
+    let revealed = (ease_out(t) * model.heatmap.len() as f64).ceil() as usize;
     let mut grid: HashMap<(u16, u16), u8> = HashMap::new();
-    for cell in &model.heatmap {
-        grid.insert((cell.col, cell.row), cell.level);
+    let mut sparkle: Option<(u16, u16)> = None;
+    for (i, cell) in model.heatmap.iter().enumerate() {
+        if i < revealed {
+            grid.insert((cell.col, cell.row), cell.level);
+            if t < 1.0 && i + 1 == revealed && cell.level > 0 {
+                sparkle = Some((cell.col, cell.row));
+            }
+        } else {
+            grid.insert((cell.col, cell.row), 0); // still-cold slot
+        }
     }
     let weeks = model.heatmap.iter().map(|c| c.col).max().unwrap_or(0) + 1;
 
@@ -1039,7 +1082,12 @@ fn draw_wrapped_heatmap(frame: &mut Frame, area: Rect, model: &WrappedModel) {
         for col in 0..weeks {
             match grid.get(&(col, row)) {
                 Some(level) => {
-                    spans.push(Span::styled("██", Style::new().fg(heat_color(*level))));
+                    let color = if sparkle == Some((col, row)) {
+                        PEAK
+                    } else {
+                        heat_color(*level)
+                    };
+                    spans.push(Span::styled("██", Style::new().fg(color)));
                     spans.push(Span::raw(" "));
                 }
                 None => spans.push(Span::raw("   ")), // outside the month
@@ -1109,7 +1157,7 @@ fn draw_wrapped_highlights(frame: &mut Frame, area: Rect, model: &WrappedModel, 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_wrapped_projects(frame: &mut Frame, area: Rect, model: &WrappedModel, blur: bool) {
+fn draw_wrapped_projects(frame: &mut Frame, area: Rect, model: &WrappedModel, blur: bool, t: f64) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(BORDER))
@@ -1165,12 +1213,20 @@ fn draw_wrapped_projects(frame: &mut Frame, area: Rect, model: &WrappedModel, bl
             ),
             Span::raw("  "),
         ];
-        spans.extend(gradient_bar(p.frac, bar_w, i));
+        // Bars sweep out in rank order; each row's numbers land with its bar.
+        let s = sweep(t, i);
+        spans.extend(gradient_bar(p.frac * s, bar_w, i));
         spans.extend([
             Span::raw("  "),
-            Span::styled(format!("{:>tokens_w$}", fmt_tokens(p.tokens)), Style::new().fg(ACCENT)),
+            Span::styled(
+                format!("{:>tokens_w$}", fmt_tokens((p.tokens as f64 * s) as u64)),
+                Style::new().fg(ACCENT),
+            ),
             Span::raw("  "),
-            Span::styled(format!("{:>cost_w$}", fmt_cost(p.est_cost)), Style::new().fg(MONEY)),
+            Span::styled(
+                format!("{:>cost_w$}", fmt_cost(p.est_cost.map(|c| c * s))),
+                Style::new().fg(MONEY),
+            ),
         ]);
         lines.push(Line::from(spans));
     }
