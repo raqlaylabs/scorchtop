@@ -1,4 +1,4 @@
-//! `agentop wrapped` — pure view-model for the monthly shareable summary.
+//! `scorchtop wrapped` — pure view-model for the monthly shareable summary.
 //! Everything the wrapped screen shows (totals, top projects, biggest
 //! session, heatmap cells, blur pseudonyms) is computed here and unit-tested;
 //! the rendering code just paints the result.

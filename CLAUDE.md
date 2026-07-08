@@ -1,6 +1,6 @@
-# agentop — project rules
+# scorchtop — project rules
 
-**agentop** is a Rust TUI that visualizes Claude Code token usage across all projects in real time — "btop for AI coding agents". Screenshot-worthy tool, not an analytics suite.
+**scorchtop** is a Rust TUI that visualizes Claude Code token usage across all projects in real time — "btop for AI coding agents". Screenshot-worthy tool, not an analytics suite.
 
 These rules are **binding across all sessions**. If a task would violate one of them, stop and say so instead of proceeding.
 
@@ -12,7 +12,7 @@ These rules are **binding across all sessions**. If a task would violate one of 
 
 ## Hard runtime constraints (never violate)
 
-- `~/.claude/` is **strictly read-only**. Never write, create, rename, or delete anything inside it — not even temp files or locks. All agentop state (byte offsets, caches) lives in `~/.local/share/agentop/` via the `directories` crate (`ProjectDirs`), so paths are correct per-platform.
+- `~/.claude/` is **strictly read-only**. Never write, create, rename, or delete anything inside it — not even temp files or locks. All scorchtop state (byte offsets, caches) lives in `~/.local/share/scorchtop/` via the `directories` crate (`ProjectDirs`), so paths are correct per-platform.
 - Never hold long-lived file handles on Claude Code's JSONL files. Per change event: open → seek to stored byte offset → read new bytes → close → update offset.
 - JSONL files are appended to while we read. Only consume complete lines ending in `\n`; buffer any trailing partial line and prepend it on the next read. A torn final line must never produce a parse error or a dropped record.
 - File watching is event-driven via the `notify` crate (FSEvents/inotify). No polling loops. Near-zero CPU when idle.
@@ -32,8 +32,8 @@ These rules are **binding across all sessions**. If a task would violate one of 
 - Project identity = directory name under `~/.claude/projects/` (it encodes the working directory path with `/` → `-`). Display name: prefer the last path component of the records' `cwd` field (the real path); fall back to best-effort decoding of the dir name.
 - Dates are computed in the **local timezone** (matches ccusage defaults).
 - Cost estimation uses a **static, hardcoded pricing table** keyed by model-name substring, per-million-token rates: input, output, cache write = 1.25× input, cache read = 0.1× input. Unknown model → count tokens, show cost as `—`, never guess. **No network calls, ever.** Label all dollar figures "est. API value" (subscription users don't pay per token).
-- **Persisted daily aggregates:** on every run, persist daily aggregates (project, day, model, token counts, est. cost) as JSON in `~/.local/share/agentop/history/`; merge persisted history with live JSONL data at load, deduplicating by (project, day, model). For overlapping keys the live JSONL scan wins (it is the source of truth); history keeps days visible after Claude Code prunes old transcripts. This is our **only write path** and it never touches `~/.claude/`.
-- **Oracle check:** `scripts/verify.sh` runs `npx ccusage@latest daily --json` and diffs its per-day token totals against `agentop dump --json`. Milestone 1 is not done until totals match within rounding.
+- **Persisted daily aggregates:** on every run, persist daily aggregates (project, day, model, token counts, est. cost) as JSON in `~/.local/share/scorchtop/history/`; merge persisted history with live JSONL data at load, deduplicating by (project, day, model). For overlapping keys the live JSONL scan wins (it is the source of truth); history keeps days visible after Claude Code prunes old transcripts. This is our **only write path** and it never touches `~/.claude/`.
+- **Oracle check:** `scripts/verify.sh` runs `npx ccusage@latest daily --json` and diffs its per-day token totals against `scorchtop dump --json`. Milestone 1 is not done until totals match within rounding.
 
 ## Testing discipline
 
@@ -45,10 +45,10 @@ These rules are **binding across all sessions**. If a task would violate one of 
 
 ## Milestones (work strictly in order)
 
-1. **Parser core (no UI).** Cargo scaffold, `Source` trait, Claude Code JSONL parser, dedup, aggregation by project/day/model, pricing table, fixtures + tests, ccusage oracle verification. Deliverable: `agentop dump --json`.
+1. **Parser core (no UI).** Cargo scaffold, `Source` trait, Claude Code JSONL parser, dedup, aggregation by project/day/model, pricing table, fixtures + tests, ccusage oracle verification. Deliverable: `scorchtop dump --json`.
 2. **Static dashboard.** Ratatui full-screen layout: header (today's est. cost, total tokens, burn-rate placeholder), main panel (projects as horizontal unicode-block bars sorted by tokens, per-project cost), footer (keybind hints). Keys: `d`/`w`/`m` period switch, `q` quit. One full parse at startup, no live updates. Must look good at 80×24 and 200×50.
 3. **Live mode.** notify watcher thread + mpsc + incremental tailing per constraints above. Animated bars, tokens/min sparkline (last hour), live-ticking today's cost, active-session indicator. Dashboard must visibly react within ~1s of Claude Code streaming in another pane.
-4. **`agentop wrapped`.** Monthly shareable summary: total tokens, est. API value, most expensive project, biggest session, GitHub-style per-day heatmap. Screenshot-worthy.
-5. **Distribution.** cargo-dist + GitHub Actions release matrix (macOS arm64/x64, Linux x64), `curl | sh` installer, npm wrapper (`npx agentop`, esbuild-style optionalDependencies). README with install one-liners and GIF placeholder.
+4. **`scorchtop wrapped`.** Monthly shareable summary: total tokens, est. API value, most expensive project, biggest session, GitHub-style per-day heatmap. Screenshot-worthy.
+5. **Distribution.** cargo-dist + GitHub Actions release matrix (macOS arm64/x64, Linux x64), `curl | sh` installer, npm wrapper (`npx scorchtop`, esbuild-style optionalDependencies). README with install one-liners and GIF placeholder.
 
 At each milestone boundary: state what was verified (tests, clippy, oracle diff) in 2–3 lines. No long Rust explanations unless asked.

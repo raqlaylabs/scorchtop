@@ -2,9 +2,9 @@
 
 use std::path::PathBuf;
 
-use agentop::aggregate::aggregate;
-use agentop::source::claude_code::ClaudeCodeSource;
-use agentop::source::Source;
+use scorchtop::aggregate::aggregate;
+use scorchtop::source::claude_code::ClaudeCodeSource;
+use scorchtop::source::Source;
 
 fn fixture_root(sub: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -84,12 +84,12 @@ fn scans_real_fixtures_when_present() {
 
 #[test]
 fn assembles_turns_from_multi_turn_fixture() {
-    use agentop::watch::Tailer;
+    use scorchtop::watch::Tailer;
 
     // Copy the fixture tree to a temp root so file mtimes are fresh — the
     // open turn's `active` flag is crash-guarded on write staleness, and a
     // checked-out fixture has an arbitrary mtime.
-    let root = std::env::temp_dir().join(format!("agentop-turns-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("scorchtop-turns-{}", std::process::id()));
     let project = root.join("-Users-test-gamma");
     std::fs::create_dir_all(&project).unwrap();
     // Read + write (not fs::copy, which preserves the old mtime on macOS).
@@ -99,7 +99,7 @@ fn assembles_turns_from_multi_turn_fixture() {
 
     let mut tailer = Tailer::new(root.clone());
     tailer.scan_all(true);
-    let snap = tailer.snapshot(&agentop::aggregate::Cube::new());
+    let snap = tailer.snapshot(&scorchtop::aggregate::Cube::new());
     std::fs::remove_dir_all(&root).ok();
 
     // Fixture: three typed prompts — one completed turn (with a streaming

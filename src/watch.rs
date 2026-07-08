@@ -399,7 +399,7 @@ pub fn run(root: PathBuf, history_dir: Option<PathBuf>, tx: Sender<Snapshot>) {
                 &cube_from(dedup(&tailer.records).0),
             );
             if let Err(e) = history::persist(dir, &merged) {
-                eprintln!("agentop: could not persist history: {e}");
+                eprintln!("scorchtop: could not persist history: {e}");
             }
             history::load(dir)
         }
@@ -414,12 +414,12 @@ pub fn run(root: PathBuf, history_dir: Option<PathBuf>, tx: Sender<Snapshot>) {
     let mut watcher = match notify::recommended_watcher(ntx) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("agentop: file watcher unavailable ({e}); showing startup data only");
+            eprintln!("scorchtop: file watcher unavailable ({e}); showing startup data only");
             return; // UI keeps the startup snapshot
         }
     };
     if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
-        eprintln!("agentop: cannot watch {}: {e}", root.display());
+        eprintln!("scorchtop: cannot watch {}: {e}", root.display());
         return;
     }
 
@@ -471,7 +471,7 @@ mod tests {
 
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir()
-            .join(format!("agentop-watch-{tag}-{}", std::process::id()))
+            .join(format!("scorchtop-watch-{tag}-{}", std::process::id()))
             .join("-u-alpha");
         let _ = fs::remove_dir_all(dir.parent().unwrap());
         fs::create_dir_all(&dir).unwrap();

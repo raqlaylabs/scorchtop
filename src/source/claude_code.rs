@@ -308,7 +308,7 @@ fn lines_written_of(content: &serde_json::Value) -> u64 {
 }
 
 /// Best-effort decode of the encoded project directory name
-/// (`-Users-naman-Documents-agentop` -> last path segment `agentop`).
+/// (`-Users-naman-Documents-scorchtop` -> last path segment `scorchtop`).
 /// Prefer `UsageRecord::cwd` when available; this is the fallback.
 pub fn display_name_from_key(key: &str) -> String {
     key.rsplit('-')
@@ -430,6 +430,6 @@ mod tests {
 
     #[test]
     fn decodes_display_name() {
-        assert_eq!(display_name_from_key("-Users-naman-Documents-agentop"), "agentop");
+        assert_eq!(display_name_from_key("-Users-naman-Documents-scorchtop"), "scorchtop");
     }
 }

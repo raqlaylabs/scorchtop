@@ -1,13 +1,13 @@
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
-use agentop::aggregate::{build_cube, rollup, Aggregates, Cube, Totals};
-use agentop::history;
-use agentop::source::claude_code::ClaudeCodeSource;
-use agentop::source::{ScanStats, Source};
+use scorchtop::aggregate::{build_cube, rollup, Aggregates, Cube, Totals};
+use scorchtop::history;
+use scorchtop::source::claude_code::ClaudeCodeSource;
+use scorchtop::source::{ScanStats, Source};
 
 #[derive(Parser)]
-#[command(name = "agentop", version, about = "btop for AI coding agents")]
+#[command(name = "scorchtop", version, about = "btop for AI coding agents")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -31,13 +31,13 @@ enum Command {
 
 struct Loaded {
     cube: Cube,
-    records: Vec<agentop::source::UsageRecord>,
+    records: Vec<scorchtop::source::UsageRecord>,
     stats: ScanStats,
     duplicates_skipped: u64,
 }
 
 /// Scan the live JSONL data, then merge with (and persist to) the history
-/// store — agentop's only write path, and it never touches `~/.claude/`.
+/// store — scorchtop's only write path, and it never touches `~/.claude/`.
 fn load() -> Loaded {
     let Some(source) = ClaudeCodeSource::new() else {
         eprintln!("could not locate home directory");
@@ -63,7 +63,7 @@ fn main() {
         Some(Command::Dump { json }) => dump(&load(), json),
         Some(Command::Wrapped { blur }) => {
             let loaded = load();
-            if let Err(e) = agentop::ui::run_wrapped(loaded.cube, loaded.records, blur) {
+            if let Err(e) = scorchtop::ui::run_wrapped(loaded.cube, loaded.records, blur) {
                 eprintln!("terminal error: {e}");
                 std::process::exit(1);
             }
@@ -76,8 +76,8 @@ fn main() {
             };
             let root = source.root().to_path_buf();
             let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || agentop::watch::run(root, history::default_dir(), tx));
-            if let Err(e) = agentop::ui::run(rx) {
+            std::thread::spawn(move || scorchtop::watch::run(root, history::default_dir(), tx));
+            if let Err(e) = scorchtop::ui::run(rx) {
                 eprintln!("terminal error: {e}");
                 std::process::exit(1);
             }
@@ -147,7 +147,7 @@ fn to_json(source: &str, agg: &Aggregates, stats: &ScanStats) -> serde_json::Val
 
 fn print_summary(agg: &Aggregates, stats: &ScanStats) {
     let t = &agg.totals;
-    println!("agentop — {} records across {} files", t.records, stats.files_scanned);
+    println!("scorchtop — {} records across {} files", t.records, stats.files_scanned);
     println!(
         "tokens: {} in / {} out / {} cache-write / {} cache-read",
         t.tokens.input, t.tokens.output, t.tokens.cache_create, t.tokens.cache_read

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Record a shareable GIF of `agentop wrapped` using vhs (brew install vhs).
+# Record a shareable GIF of `scorchtop wrapped` using vhs (brew install vhs).
 #
 # Seeds a sandbox with a deterministic fake month of usage (the real
 # ~/.claude is never read or written), then records: entrance animation on
@@ -9,7 +9,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$REPO/assets/wrapped-demo.gif}"
-SB="${AGENTOP_DEMO_DIR:-${TMPDIR:-/tmp}/agentop-wrapped-demo}"
+SB="${SCORCHTOP_DEMO_DIR:-${TMPDIR:-/tmp}/scorchtop-wrapped-demo}"
 
 command -v vhs >/dev/null || { echo "vhs not found: brew install vhs" >&2; exit 1; }
 
@@ -83,7 +83,7 @@ Type "export HOME='$SB/home' XDG_DATA_HOME='$SB/xdg' PATH='$REPO/target/release'
 Enter
 Show
 Sleep 300ms
-Type "agentop wrapped"
+Type "scorchtop wrapped"
 Sleep 600ms
 Enter
 Sleep 2.5s

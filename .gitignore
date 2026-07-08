@@ -1,3 +1,8 @@
 /target
 # Real usage data copied from ~/.claude — not committed until reviewed for sensitive content
 /tests/fixtures/real/
+.DS_Store
+# Recordings made with the in-app 'r' key land in the cwd
+/*.gif
+/*.cast
+!/assets/**

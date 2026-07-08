@@ -1,7 +1,7 @@
-//! Persisted daily aggregates — agentop's ONLY write path.
+//! Persisted daily aggregates — scorchtop's ONLY write path.
 //!
 //! On every run the (project, day, model) cube is persisted as JSON under
-//! `~/.local/share/agentop/history/` and merged with the live JSONL scan at
+//! `~/.local/share/scorchtop/history/` and merged with the live JSONL scan at
 //! load. For overlapping keys the live scan wins (the transcripts are the
 //! source of truth); history keeps days visible after Claude Code prunes old
 //! transcripts. Nothing here ever touches `~/.claude/`.
@@ -17,13 +17,13 @@ use crate::source::TokenUsage;
 
 const FILE_NAME: &str = "daily.json";
 
-/// `$XDG_DATA_HOME/agentop/history` or `~/.local/share/agentop/history`.
+/// `$XDG_DATA_HOME/scorchtop/history` or `~/.local/share/scorchtop/history`.
 pub fn default_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(xdg).join("agentop").join("history"));
+        return Some(PathBuf::from(xdg).join("scorchtop").join("history"));
     }
     let home = directories::BaseDirs::new()?.home_dir().to_path_buf();
-    Some(home.join(".local").join("share").join("agentop").join("history"))
+    Some(home.join(".local").join("share").join("scorchtop").join("history"))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -108,7 +108,7 @@ pub fn persist(dir: &Path, cube: &Cube) -> std::io::Result<()> {
 pub fn sync(dir: &Path, live: &Cube) -> Cube {
     let merged = merge(load(dir), live);
     if let Err(e) = persist(dir, &merged) {
-        eprintln!("agentop: could not persist history to {}: {e}", dir.display());
+        eprintln!("scorchtop: could not persist history to {}: {e}", dir.display());
     }
     merged
 }
@@ -136,7 +136,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir()
-            .join(format!("agentop-test-{tag}-{}", std::process::id()));
+            .join(format!("scorchtop-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }

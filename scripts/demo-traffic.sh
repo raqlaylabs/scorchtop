@@ -3,13 +3,13 @@
 # Never touches the real ~/.claude. Usage:
 #
 #   terminal 1:  ./scripts/demo-traffic.sh            # writes data + prints the run command
-#   terminal 2:  HOME=<sandbox>/home XDG_DATA_HOME=<sandbox>/xdg ./target/debug/agentop
+#   terminal 2:  HOME=<sandbox>/home XDG_DATA_HOME=<sandbox>/xdg ./target/debug/scorchtop
 #
 set -euo pipefail
 
-SANDBOX="${AGENTOP_DEMO_DIR:-${TMPDIR:-/tmp}/agentop-demo}"
+SANDBOX="${SCORCHTOP_DEMO_DIR:-${TMPDIR:-/tmp}/scorchtop-demo}"
 ROOT="$SANDBOX/home/.claude/projects"
-PROJECTS=(mira-app agentop web-frontend)
+PROJECTS=(mira-app scorchtop web-frontend)
 MODELS=(claude-opus-4-8 claude-sonnet-5 claude-haiku-4-5)
 
 mkdir -p "$SANDBOX/xdg"
@@ -21,7 +21,7 @@ echo "sandbox: $SANDBOX"
 echo
 echo "run the dashboard in another terminal:"
 echo
-echo "  HOME=$SANDBOX/home XDG_DATA_HOME=$SANDBOX/xdg ./target/debug/agentop"
+echo "  HOME=$SANDBOX/home XDG_DATA_HOME=$SANDBOX/xdg ./target/debug/scorchtop"
 echo
 echo "streaming fake traffic (ctrl-c to stop)…"
 

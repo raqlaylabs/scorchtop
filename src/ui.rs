@@ -23,7 +23,7 @@ use crate::watch::Snapshot;
 use crate::wrapped::{self, Month, WrappedModel};
 
 // ---------------------------------------------------------------------------
-// Palette: agentop paints its own dark theme (truecolor), btop-style, instead
+// Palette: scorchtop paints its own dark theme (truecolor), btop-style, instead
 // of inheriting the terminal's colors.
 
 const BG_RGB: (u8, u8, u8) = (9, 12, 18);
@@ -357,7 +357,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let scanning = app.snapshot.is_none();
 
     let mut title_spans = vec![
-        Span::styled(" agentop ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" scorchtop ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(format!("v{} ", env!("CARGO_PKG_VERSION")), Style::new().fg(DIM)),
     ];
     if scanning {
@@ -873,7 +873,7 @@ fn stacked_bar(
 }
 
 // ---------------------------------------------------------------------------
-// `agentop wrapped` — monthly summary screen. A short entrance animation
+// `scorchtop wrapped` — monthly summary screen. A short entrance animation
 // (bars sweep in, the heatmap fills chronologically, headline numbers count
 // up) plays on open and on month change, then the screen settles into a
 // static scorecard and blocks on input — no watcher, near-zero idle CPU.
@@ -946,7 +946,7 @@ pub fn run_wrapped(
                         KeyCode::Char('b') => blur = !blur,
                         KeyCode::Char('r') => {
                             let name = format!(
-                                "agentop-wrapped-{}.gif",
+                                "scorchtop-wrapped-{}.gif",
                                 model.label.to_lowercase().replace(' ', "-")
                             );
                             notice = Some(match terminal
@@ -1035,7 +1035,7 @@ fn draw_wrapped(
 
 fn draw_wrapped_header(frame: &mut Frame, area: Rect, model: &WrappedModel, blur: bool, t: f64) {
     let mut title_spans = vec![
-        Span::styled(" agentop ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" scorchtop ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled("wrapped ", Style::new().fg(FG).add_modifier(Modifier::BOLD)),
         Span::styled(format!("v{} ", env!("CARGO_PKG_VERSION")), Style::new().fg(DIM)),
     ];

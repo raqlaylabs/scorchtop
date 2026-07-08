@@ -64,7 +64,7 @@ pub fn write_cast(
         "version": 2,
         "width": width,
         "height": height,
-        "title": "agentop wrapped",
+        "title": "scorchtop wrapped",
     });
     writeln!(file, "{header}")?;
     for (i, (time, frame)) in frames.iter().enumerate() {
@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn cast_file_is_valid_json_lines_with_header() {
-        let dir = std::env::temp_dir().join(format!("agentop-cast-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("scorchtop-cast-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.cast");
 

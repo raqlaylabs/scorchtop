@@ -1,9 +1,9 @@
 ---
 name: verify
-description: Build, launch, and drive the agentop TUI against sandboxed fake data to verify changes end-to-end.
+description: Build, launch, and drive the scorchtop TUI against sandboxed fake data to verify changes end-to-end.
 ---
 
-# Verifying agentop
+# Verifying scorchtop
 
 ## Golden rule
 
@@ -14,13 +14,13 @@ and `XDG_DATA_HOME` (isolates the history write path).
 ## Quick demo / animation tuning
 
 `./scripts/demo-traffic.sh` streams fake bursty traffic into a sandbox
-(`AGENTOP_DEMO_DIR` overrides the location) and prints the matching
-`HOME=... XDG_DATA_HOME=... ./target/debug/agentop` command to run in a second
+(`SCORCHTOP_DEMO_DIR` overrides the location) and prints the matching
+`HOME=... XDG_DATA_HOME=... ./target/debug/scorchtop` command to run in a second
 terminal. Use it to eyeball the equalizer physics and record GIFs.
 
 ## Recipe
 
-1. Build: `cargo build` (binary at `target/debug/agentop`).
+1. Build: `cargo build` (binary at `target/debug/scorchtop`).
 2. Fake data: `mkdir -p $SANDBOX/home/.claude/projects/-tmp-demoapp` and write
    JSONL lines shaped like:
    ```json
@@ -29,13 +29,13 @@ terminal. Use it to eyeball the equalizer physics and record GIFs.
    Use current timestamps (`date -u +%Y-%m-%dT%H:%M:%S.000Z`) so records land
    in "today" / trigger the live indicator (2-minute window).
 3. Launch in an isolated tmux server:
-   `tmux -L agentop-verify new-session -d -x 120 -y 30 "HOME=$SANDBOX/home XDG_DATA_HOME=$SANDBOX/xdg ./target/debug/agentop"`
-4. Observe: `tmux -L agentop-verify capture-pane -p`.
+   `tmux -L scorchtop-verify new-session -d -x 120 -y 30 "HOME=$SANDBOX/home XDG_DATA_HOME=$SANDBOX/xdg ./target/debug/scorchtop"`
+4. Observe: `tmux -L scorchtop-verify capture-pane -p`.
 5. Live reactivity: append a line to a jsonl file, `sleep 1`, capture again —
    header totals/burn must change and bars re-sort within ~1s.
-6. Keys: `tmux -L agentop-verify send-keys d|w|m|q`. Resize with
+6. Keys: `tmux -L scorchtop-verify send-keys d|w|m|q`. Resize with
    `resize-window -x 80 -y 24` (must stay legible at 80×24).
-7. Cleanup: `tmux -L agentop-verify kill-server`.
+7. Cleanup: `tmux -L scorchtop-verify kill-server`.
 
 ## Probes worth repeating
 
@@ -45,7 +45,7 @@ terminal. Use it to eyeball the equalizer physics and record GIFs.
 - Live dedup: re-append an existing (`message.id`, `requestId`) with larger
   `output_tokens` → totals grow only by the output delta.
 - Write isolation: after quit, `find $SANDBOX/home/.claude -type f` shows only
-  your fixtures; history lands in `$SANDBOX/xdg/agentop/history/daily.json`.
+  your fixtures; history lands in `$SANDBOX/xdg/scorchtop/history/daily.json`.
 - Activity signal (turn-state based): a `{"type":"user",...}` line (prompt or
   tool result) flips the project to `● live` within ~1s; an assistant line
   with `"stop_reason":"end_turn"` flips it back to idle — even if the file
@@ -56,6 +56,6 @@ terminal. Use it to eyeball the equalizer physics and record GIFs.
 
 ## Oracle (data correctness)
 
-`bash scripts/verify.sh` — builds, runs `agentop dump --json` against the real
+`bash scripts/verify.sh` — builds, runs `scorchtop dump --json` against the real
 `~/.claude` (read-only), diffs per-day totals vs `npx ccusage@latest daily --json`.
 Closed days must match exactly; today is skipped (still being written).

@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn writes_an_animated_gif() {
-        let dir = std::env::temp_dir().join(format!("agentop-gif-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("scorchtop-gif-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.gif");
 

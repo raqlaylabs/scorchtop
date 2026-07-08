@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Oracle check: diff agentop's per-day token totals against ccusage.
+# Oracle check: diff scorchtop's per-day token totals against ccusage.
 # Milestone 1 is not done until totals match within rounding.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "==> building agentop"
+echo "==> building scorchtop"
 cargo build --quiet --release
 
-echo "==> running agentop dump --json"
-./target/release/agentop dump --json > /tmp/agentop-dump.json
+echo "==> running scorchtop dump --json"
+./target/release/scorchtop dump --json > /tmp/scorchtop-dump.json
 
 echo "==> running ccusage oracle (npx ccusage@latest daily --json)"
 npx -y ccusage@latest daily --json > /tmp/ccusage-daily.json
@@ -22,7 +22,7 @@ from datetime import date
 # script), so the two snapshots race each other — compare closed days only.
 today = date.today().isoformat()
 
-ours = {d["date"]: d for d in json.load(open("/tmp/agentop-dump.json"))["days"]}
+ours = {d["date"]: d for d in json.load(open("/tmp/scorchtop-dump.json"))["days"]}
 theirs = {d["period"]: d for d in json.load(open("/tmp/ccusage-daily.json"))["daily"]}
 
 fields = [
@@ -40,18 +40,18 @@ for day in sorted(set(ours) | set(theirs)):
         continue
     o, t = ours.get(day), theirs.get(day)
     if o is None:
-        print(f"  {day}: only in ccusage (missing from agentop)")
+        print(f"  {day}: only in ccusage (missing from scorchtop)")
         bad += 1
         continue
     if t is None:
-        # agentop merges persisted history, so it keeps days whose JSONL
+        # scorchtop merges persisted history, so it keeps days whose JSONL
         # transcripts Claude Code has already pruned. Not an error.
-        print(f"  {day}: only in agentop (history of pruned transcripts) — ok")
+        print(f"  {day}: only in scorchtop (history of pruned transcripts) — ok")
         continue
     checked += 1
     for of, tf in fields:
         if o[of] != t[tf]:
-            print(f"  {day}: {of} agentop={o[of]} ccusage={t[tf]} (diff {o[of]-t[tf]:+d})")
+            print(f"  {day}: {of} scorchtop={o[of]} ccusage={t[tf]} (diff {o[of]-t[tf]:+d})")
             bad += 1
 
 if bad:
