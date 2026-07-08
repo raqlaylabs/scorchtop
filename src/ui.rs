@@ -808,8 +808,11 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
         Style::new().fg(DIM),
     ))
     .right_aligned();
+    // The note overlays the same row; draw it only when it truly fits next
+    // to the hints, or it paints over the last keybinds.
+    let fits = (area.width as usize) > hints.width() + note.width();
     frame.render_widget(Paragraph::new(hints), area);
-    if area.width >= 100 {
+    if fits {
         frame.render_widget(Paragraph::new(note), area);
     }
 }
