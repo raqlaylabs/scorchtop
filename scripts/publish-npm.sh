@@ -6,7 +6,7 @@
 # Downloads the release tarballs, wraps each binary in a platform package
 # (scorchtop-darwin-arm64, …), publishes those, then publishes the main
 # "scorchtop" wrapper that references them via optionalDependencies.
-# Requires: gh (authenticated), npm (logged in), tar with xz support.
+# Requires: npm (logged in), curl, tar with xz support.
 set -euo pipefail
 
 VERSION="${1:?usage: publish-npm.sh <version, e.g. 0.1.0>}"
@@ -21,11 +21,10 @@ TARGETS=(
   "x86_64-unknown-linux-gnu linux-x64 linux x64"
 )
 
-gh release download "v$VERSION" --repo raqlaylabs/scorchtop \
-  --pattern '*.tar.xz' --dir "$WORK"
-
+BASE="https://github.com/raqlaylabs/scorchtop/releases/download/v$VERSION"
 for spec in "${TARGETS[@]}"; do
   read -r triple suffix os cpu <<<"$spec"
+  curl -fLsS -o "$WORK/scorchtop-$triple.tar.xz" "$BASE/scorchtop-$triple.tar.xz"
   pkg="$WORK/pkg-$suffix"
   mkdir -p "$pkg/bin"
   tar -xJf "$WORK/scorchtop-$triple.tar.xz" -C "$WORK"
