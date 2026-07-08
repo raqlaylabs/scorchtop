@@ -104,19 +104,21 @@ fn assembles_turns_from_multi_turn_fixture() {
 
     // Fixture: three typed prompts — one completed turn (with a streaming
     // duplicate and a Write), one interrupted, one still open at EOF.
-    assert_eq!(snap.turns.len(), 3, "one row per typed prompt");
+    assert_eq!(snap.turns.len(), 1, "one project, one group");
+    let group = &snap.turns[0];
+    assert_eq!(group.project, "gamma");
+    assert_eq!(group.turns.len(), 3, "one row per typed prompt");
     assert_eq!(snap.duplicates_skipped, 1, "streaming duplicate reconciled");
 
     // Newest first: the open turn ("now add tests").
-    let open = &snap.turns[0];
-    assert_eq!(open.project, "gamma");
+    let open = &group.turns[0];
     assert_eq!(open.prompt_chars, "now add tests".chars().count() as u64);
     assert_eq!(open.tokens, 200 + 20);
     assert_eq!(open.lines_written, 2, "Edit new_string has 2 lines");
     assert!(open.active, "no end_turn yet and the file was just written");
 
     // Interrupted turn: closed, nothing produced.
-    let interrupted = &snap.turns[1];
+    let interrupted = &group.turns[1];
     assert_eq!(interrupted.prompt_chars, "quick question".chars().count() as u64);
     assert_eq!(interrupted.tokens, 0);
     assert_eq!(interrupted.lines_written, 0);
@@ -124,7 +126,7 @@ fn assembles_turns_from_multi_turn_fixture() {
 
     // Completed turn: dedup keeps the larger streaming output (150, not 100),
     // and the end_turn reply's own usage counts toward the turn.
-    let done = &snap.turns[2];
+    let done = &group.turns[2];
     assert_eq!(done.prompt_chars, "add a login page".chars().count() as u64);
     assert_eq!(done.tokens, (1000 + 150) + (500 + 50));
     assert_eq!(done.lines_written, 4, "the duplicate Write must not double-count lines");

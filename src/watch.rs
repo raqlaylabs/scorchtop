@@ -27,7 +27,7 @@ use crate::history;
 use crate::lines::LineBuffer;
 use crate::source::claude_code::{display_name_from_key, parse_line, LineMeta, LineOutcome, TurnSignal};
 use crate::source::{ScanStats, UsageRecord};
-use crate::view::TurnRow;
+use crate::view::TurnGroup;
 
 /// Per-project turn state. `working` follows the transcript's own protocol —
 /// a user line (prompt or tool result) starts a turn, an assistant
@@ -51,8 +51,8 @@ pub struct Snapshot {
     pub recent: Vec<UsageRecord>,
     /// Per-project last write time, for the live/idle indicators.
     pub activity: Vec<ProjectActivity>,
-    /// Recent prompt→reply turns, newest first, for the turns panel.
-    pub turns: Vec<TurnRow>,
+    /// Recent prompt→reply turns for the turns panel, grouped by project.
+    pub turns: Vec<TurnGroup>,
     pub stats: ScanStats,
     pub duplicates_skipped: u64,
 }

@@ -736,8 +736,8 @@ fn draw_turns(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let turns = app.snapshot.as_ref().map(|s| s.turns.as_slice()).unwrap_or_default();
-    if turns.is_empty() {
+    let groups = app.snapshot.as_ref().map(|s| s.turns.as_slice()).unwrap_or_default();
+    if groups.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "no prompts seen yet",
@@ -748,47 +748,41 @@ fn draw_turns(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let lines: Vec<Line> = turns
-        .iter()
-        .take(inner.height as usize)
-        .enumerate()
-        .map(|(i, t)| {
+    let mut lines: Vec<Line> = Vec::new();
+    for g in groups {
+        let live_group = g.turns.iter().any(|t| t.active);
+        lines.push(Line::from(Span::styled(
+            g.project.clone(),
+            Style::new().fg(if live_group { LIVE } else { FG }).add_modifier(Modifier::BOLD),
+        )));
+        for t in &g.turns {
             let dot = if t.active {
-                Span::styled("● ", Style::new().fg(if blink_on() { LIVE } else { LIVE_DIM }))
+                Span::styled(" ● ", Style::new().fg(if blink_on() { LIVE } else { LIVE_DIM }))
             } else {
-                Span::raw("  ")
+                Span::raw("   ")
             };
-            let name: String = if t.project.chars().count() > 9 {
-                format!("{}…", t.project.chars().take(8).collect::<String>())
-            } else {
-                format!("{:<9}", t.project)
-            };
-            // Runs of the same project read as one group: only the first row
-            // of a run gets a bright name, so project changes pop.
-            let repeated = i > 0 && turns[i - 1].project == t.project;
-            let name_style = if t.active {
-                Style::new().fg(LIVE).add_modifier(Modifier::BOLD)
-            } else if repeated {
-                Style::new().fg(DIM)
-            } else {
-                Style::new().fg(FG).add_modifier(Modifier::BOLD)
-            };
-            Line::from(vec![
+            lines.push(Line::from(vec![
                 dot,
-                Span::styled(name, name_style),
                 Span::styled(
-                    format!("{:>7}", format!("{}ch", fmt_tokens(t.prompt_chars))),
+                    format!("{:>8}", format!("{}ch", fmt_tokens(t.prompt_chars))),
                     Style::new().fg(DIM),
                 ),
-                Span::styled(format!("{:>8}", fmt_tokens(t.tokens)), Style::new().fg(ACCENT)),
+                Span::styled(format!("{:>9}", fmt_tokens(t.tokens)), Style::new().fg(ACCENT)),
                 Span::styled(
-                    format!("{:>7}", format!("{}ln", fmt_tokens(t.lines_written))),
+                    format!("{:>8}", format!("{}ln", fmt_tokens(t.lines_written))),
                     Style::new().fg(PEAK),
                 ),
-                Span::styled(format!("{:>9}", fmt_cost(t.est_cost)), Style::new().fg(MONEY)),
-            ])
-        })
-        .collect();
+                Span::styled(format!("{:>10}", fmt_cost(t.est_cost)), Style::new().fg(MONEY)),
+            ]));
+        }
+    }
+    let visible = inner.height as usize;
+    if lines.len() > visible {
+        lines.truncate(visible);
+        if let Some(last) = lines.last_mut() {
+            *last = Line::from(Span::styled("…", Style::new().fg(DIM)));
+        }
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 

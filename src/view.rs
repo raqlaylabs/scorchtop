@@ -196,8 +196,6 @@ pub fn live_stats(
 /// `lines_written` is Write/Edit output, deliberately not "surviving code".
 #[derive(Debug, Clone)]
 pub struct TurnRow {
-    /// Project display name.
-    pub project: String,
     pub prompt_chars: u64,
     /// Total tokens of this turn's deduped records (subagent transcripts in
     /// separate files are not attributable, so this is a floor).
@@ -209,17 +207,27 @@ pub struct TurnRow {
     pub active: bool,
 }
 
-/// Newest turns shown in the panel.
+/// Turns of one project, newest first.
+#[derive(Debug, Clone)]
+pub struct TurnGroup {
+    /// Project display name.
+    pub project: String,
+    pub turns: Vec<TurnRow>,
+}
+
+/// Newest turns shown in the panel (across all groups).
 pub const TURN_ROW_LIMIT: usize = 15;
 
 /// Join per-file turn metadata with deduplicated records (matched on
-/// `UsageRecord::turn`) into display rows, newest first. Each meta arrives as
-/// (project display name, that file's last write time, meta).
+/// `UsageRecord::turn`) into display rows: the newest `TURN_ROW_LIMIT` turns,
+/// grouped by project. Groups are ordered by their newest turn, turns within
+/// a group newest first. Each meta arrives as (project display name, that
+/// file's last write time, meta).
 pub fn turn_rows(
     turns: &[(String, chrono::DateTime<chrono::Utc>, crate::watch::TurnMeta)],
     records: &[&crate::source::UsageRecord],
     now: chrono::DateTime<chrono::Utc>,
-) -> Vec<TurnRow> {
+) -> Vec<TurnGroup> {
     #[derive(Default)]
     struct Acc {
         tokens: u64,
@@ -240,12 +248,11 @@ pub fn turn_rows(
     }
 
     let stale_cutoff = now - chrono::Duration::seconds(STALE_WORK_SECS);
-    let mut rows: Vec<(u32, TurnRow)> = turns
+    let mut rows: Vec<(u32, &str, TurnRow)> = turns
         .iter()
         .map(|(project, last_write, meta)| {
             let acc = by_turn.remove(&meta.id).unwrap_or_default();
-            (meta.id, TurnRow {
-                project: project.clone(),
+            (meta.id, project.as_str(), TurnRow {
                 prompt_chars: meta.prompt_chars,
                 tokens: acc.tokens,
                 est_cost: if acc.has_unknown_model && acc.known_cost == 0.0 {
@@ -261,9 +268,20 @@ pub fn turn_rows(
         .collect();
     // Timestamps are second-resolution, so same-second prompts tie; within a
     // file the turn id is chronological and breaks the tie.
-    rows.sort_by_key(|(id, r)| std::cmp::Reverse((r.started, *id)));
+    rows.sort_by_key(|(id, _, r)| std::cmp::Reverse((r.started, *id)));
     rows.truncate(TURN_ROW_LIMIT);
-    rows.into_iter().map(|(_, r)| r).collect()
+
+    // Group by project, groups ordered by their newest turn. `rows` is
+    // already newest-first, so first appearance fixes the group order and
+    // pushes keep turns newest-first within each group.
+    let mut groups: Vec<TurnGroup> = Vec::new();
+    for (_, project, row) in rows {
+        match groups.iter_mut().find(|g| g.project == project) {
+            Some(g) => g.turns.push(row),
+            None => groups.push(TurnGroup { project: project.to_string(), turns: vec![row] }),
+        }
+    }
+    groups
 }
 
 /// Total tokens per project (display name) over the recent window. The UI
@@ -477,27 +495,35 @@ mod tests {
             // Open turn whose file went silent 20 min ago: crash-guarded.
             ("beta".to_string(), now - chrono::Duration::minutes(20), meta(3, 15, false)),
         ];
-        let rows = turn_rows(&turns, &refs, now);
+        let groups = turn_rows(&turns, &refs, now);
 
-        assert_eq!(rows.len(), 3, "newest first");
-        assert_eq!(rows[0].prompt_chars, 20);
-        assert!(rows[0].active);
-        assert_eq!(rows[0].est_cost, None, "unpriced model shows — not a guess");
-        assert_eq!(rows[0].tokens, 999);
+        // Groups ordered by newest turn: alpha (5 min ago) before beta.
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].project, "alpha");
+        assert_eq!(groups[0].turns.len(), 2, "alpha's turns grouped together");
+        assert_eq!(groups[1].project, "beta");
 
-        assert!(!rows[1].active, "stale mid-turn file must not read as live");
-        assert_eq!(rows[1].tokens, 0);
+        let open = &groups[0].turns[0];
+        assert_eq!(open.prompt_chars, 20, "newest first within the group");
+        assert!(open.active);
+        assert_eq!(open.est_cost, None, "unpriced model shows — not a guess");
+        assert_eq!(open.tokens, 999);
 
-        let done = &rows[2];
+        let done = &groups[0].turns[1];
         assert_eq!(done.tokens, 150, "records grouped by turn id");
         assert_eq!(done.lines_written, 6);
         assert!(!done.active);
         assert!(done.est_cost.unwrap() > 0.0);
 
-        // Rows are capped at the display limit.
+        let stale = &groups[1].turns[0];
+        assert!(!stale.active, "stale mid-turn file must not read as live");
+        assert_eq!(stale.tokens, 0);
+
+        // Turns are capped at the display limit across all groups.
         let many: Vec<_> =
             (10..40).map(|i| ("alpha".to_string(), now, meta(i, i as i64, true))).collect();
-        assert_eq!(turn_rows(&many, &[], now).len(), TURN_ROW_LIMIT);
+        let capped = turn_rows(&many, &[], now);
+        assert_eq!(capped.iter().map(|g| g.turns.len()).sum::<usize>(), TURN_ROW_LIMIT);
     }
 
     #[test]
