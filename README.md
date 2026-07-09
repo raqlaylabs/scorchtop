@@ -93,6 +93,20 @@ capture, no external tools, works over SSH.
 - Currently supports Claude Code; the source layer is a trait, adapters for
   other agents welcome.
 
+## Future scope
+
+Ideas on the table (PRs welcome):
+
+- [ ] **Codex adapter** — surface OpenAI Codex / `gpt-*` usage through the same `Source` trait.
+- [ ] **Gemini adapter** — same for Gemini CLI transcripts.
+- [ ] **Global dashboard** — aggregate usage across a whole team of devs into one shared view (opt-in, self-hosted).
+- [ ] **Budget & alerts** — configurable daily/monthly thresholds with an in-TUI warning when you're burning past them.
+- [ ] **Custom pricing config** — override the hardcoded rate table for negotiated/enterprise pricing.
+- [ ] **Session drill-down** — expand a project into its individual sessions, with per-session cost and duration.
+- [ ] **History export** — dump daily aggregates to CSV/JSON for spreadsheets or dashboards.
+- [ ] **Homebrew formula** — `brew install scorchtop` alongside the curl and npm installers.
+- [ ] **Themes** — a few built-in color palettes beyond the default.
+
 ## License
 
 MIT. Bundled JetBrains Mono font is under the [OFL](assets/fonts/OFL.txt).
